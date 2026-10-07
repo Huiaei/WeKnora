@@ -79,21 +79,26 @@ jobs:
         run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_CLI_VERSION }}
 
       - name: Install SQLite dev headers (Windows)
-        # sqlite-vec-go-bindings needs sqlite3.h for CGO compilation;
-        # the MSVC toolchain on the runner does not include it.
+        # sqlite-vec-go-bindings/cgo uses #include "sqlite3.h" with -DSQLITE_CORE.
+        # The header is NOT bundled in the sqlite-vec module, nor provided by
+        # mattn/go-sqlite3 (which uses a renamed sqlite3-binding.h). So we must
+        # supply sqlite3.h ourselves.
+        # Download the amalgamation to a space-free path (CGO splits CFLAGS on
+        # spaces). The amalgamation has sqlite3.h at its ROOT, not in include/.
         if: runner.os == 'Windows'
+        shell: bash
         run: |
-          choco install sqlite -y
-          # 关键：choco 把 SQLite 装在 "C:\Program Files\SQLite"（含空格）；
-          # CGO 的 CFLAGS 按**空格**切分，路径含空格会让 gcc 把路径断开。
-          # 因此软链接到无空格路径，再用 -I/c/sqlite/include。
-          cmd /c "mklink /D C:\sqlite \"C:\Program Files\SQLite\""
+          mkdir -p /c/sqlite
+          curl -fsSL -o /c/sqlite/amalgamation.zip "https://www.sqlite.org/2025/sqlite-amalgamation-3500100.zip"
+          unzip -o /c/sqlite/amalgamation.zip -d /c/sqlite/
+          mv /c/sqlite/sqlite-amalgamation-3500100/* /c/sqlite/ 2>/dev/null || true
+          ls /c/sqlite/sqlite3.h /c/sqlite/sqlite3ext.h
 
       - name: Pre-compile Go packages (warm cache)
         shell: bash
         run: |
           export GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn
-          export CGO_CFLAGS="-Wno-deprecated-declarations -I/c/sqlite/include"
+          export CGO_CFLAGS="-Wno-deprecated-declarations -I/c/sqlite"
           cd cmd/desktop
           go build -p 1 -buildvcs=false -tags "desktop,sqlite_fts5,production" -o _prebuild_tmp.exe . || true
           rm -f _prebuild_tmp.exe
@@ -118,7 +123,7 @@ jobs:
           export GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn
           eval "$(./scripts/get_version.sh env)"
           LDFLAGS="$(./scripts/get_version.sh ldflags) -X 'google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn'"
-          export CGO_CFLAGS="-Wno-deprecated-declarations -I/c/sqlite/include"
+          export CGO_CFLAGS="-Wno-deprecated-declarations -I/c/sqlite"
 
           bash ./scripts/check-license-bundle.sh
           cd cmd/desktop
@@ -182,6 +187,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
       - uses: actions/download-artifact@v8
         with:
           name: desktop-exe
@@ -191,6 +200,9 @@ jobs:
         with:
           name: duckdb-extensions
           path: dist/
+
+      - name: Download gojieba module (for jieba-dict extraction)
+        run: go mod download github.com/yanyiwu/gojieba
 
       - name: Assemble portable package
         run: |
