@@ -131,7 +131,7 @@ jobs:
             -tags "desktop,sqlite_fts5" \
             -platform windows/amd64 \
             -ldflags="${LDFLAGS}" \
-            -o "WeKnora Lite"
+            -o WeKnora-Lite
 
       - name: Locate built exe
         shell: bash
