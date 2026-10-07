@@ -193,10 +193,20 @@ jobs:
 
           ls -la
 
+          # upload-artifact roots an uploaded directory at the least common
+          # ancestor of the matched files, so `path: duckdb-home/` would NOT
+          # keep the duckdb-home/extensions/<ver>/windows_amd64_mingw/ layout
+          # (both files live in the same leaf dir, so the prefix is dropped).
+          # The launcher sets DUCKDB_HOME=%PORTABLE_ROOT%\duckdb-home and audits
+          # duckdb-home\extensions, so ship a tarball and keep the layout exact.
+          cd "${GITHUB_WORKSPACE}"
+          tar czf duckdb-extensions.tar.gz duckdb-home
+          tar tzf duckdb-extensions.tar.gz
+
       - uses: actions/upload-artifact@v7
         with:
           name: duckdb-extensions
-          path: duckdb-home/
+          path: duckdb-extensions.tar.gz
           retention-days: 1
 
   # ── 4. 便携打包（合并 exe + 前端 + 扩展 + 启动器）──
@@ -215,10 +225,22 @@ jobs:
           name: desktop-exe
           path: dist/
 
+      # The portable package must ship the SPA: the backend serves it from
+      # ./web (internal/router/static.go), and the assembly below copies
+      # ../web into dist/. That directory only exists once the frontend-dist
+      # artifact is downloaded, so fetch it here as build-desktop does.
+      - uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: web/
+
       - uses: actions/download-artifact@v8
         with:
           name: duckdb-extensions
-          path: dist/
+          path: exts/
+
+      - name: Unpack DuckDB extensions
+        run: tar xzf exts/duckdb-extensions.tar.gz -C dist/
 
       - name: Download gojieba module (for jieba-dict extraction)
         run: go mod download github.com/yanyiwu/gojieba
@@ -260,8 +282,17 @@ jobs:
         run: |
           VERSION="${{ inputs.tag }}"
           if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-            VERSION="$(git describe --tags --abbrev=0 2>/dev/null || echo latest)"
+            # checkout runs with fetch-depth 1 / fetch-tags false, so a tag
+            # push has no local tags to describe. Prefer the ref, and only
+            # fall back to describe for branch runs — this must match the
+            # VERSION the release step derives from GITHUB_REF below.
+            if [ -n "${GITHUB_REF#refs/tags/}" ] && [ "${GITHUB_REF#refs/tags/}" != "${GITHUB_REF}" ]; then
+              VERSION="${GITHUB_REF#refs/tags/}"
+            else
+              VERSION="$(git describe --tags --abbrev=0 2>/dev/null || echo latest)"
+            fi
           fi
+          echo "archive version: ${VERSION}"
           ARCHIVE="WeKnora-Lite-portable_windows_amd64_${VERSION}"
           cd dist
           zip -r "../${ARCHIVE}.zip" .
