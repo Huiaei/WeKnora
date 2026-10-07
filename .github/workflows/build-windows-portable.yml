@@ -82,13 +82,18 @@ jobs:
         # sqlite-vec-go-bindings needs sqlite3.h for CGO compilation;
         # the MSVC toolchain on the runner does not include it.
         if: runner.os == 'Windows'
-        run: choco install sqlite -y
+        run: |
+          choco install sqlite -y
+          # 关键：choco 把 SQLite 装在 "C:\Program Files\SQLite"（含空格）；
+          # CGO 的 CFLAGS 按**空格**切分，路径含空格会让 gcc 把路径断开。
+          # 因此软链接到无空格路径，再用 -I/c/sqlite/include。
+          cmd /c "mklink /D C:\sqlite \"C:\Program Files\SQLite\""
 
       - name: Pre-compile Go packages (warm cache)
         shell: bash
         run: |
           export GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn
-          export CGO_CFLAGS="-Wno-deprecated-declarations -I\"C:\\Program Files\\SQLite\\include\""
+          export CGO_CFLAGS="-Wno-deprecated-declarations -I/c/sqlite/include"
           cd cmd/desktop
           go build -p 1 -buildvcs=false -tags "desktop,sqlite_fts5,production" -o _prebuild_tmp.exe . || true
           rm -f _prebuild_tmp.exe
@@ -113,7 +118,7 @@ jobs:
           export GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn
           eval "$(./scripts/get_version.sh env)"
           LDFLAGS="$(./scripts/get_version.sh ldflags) -X 'google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn'"
-          export CGO_CFLAGS="-Wno-deprecated-declarations -I\"C:\\Program Files\\SQLite\\include\""
+          export CGO_CFLAGS="-Wno-deprecated-declarations -I/c/sqlite/include"
 
           bash ./scripts/check-license-bundle.sh
           cd cmd/desktop
