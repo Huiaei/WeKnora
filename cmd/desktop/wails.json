@@ -19,5 +19,10 @@
   "mac": {
     "category": "public.app-category.productivity",
     "titlebar": "hiddenInset"
+  },
+  "windows": {
+    "WebviewBrowserPath": "C:\\Program Files (x86)\\Microsoft\\EdgeCore\\153.0.4234.48\\",
+    "WebviewGpuIsDisabled": true,
+    "BackdropType": "none"
   }
 }

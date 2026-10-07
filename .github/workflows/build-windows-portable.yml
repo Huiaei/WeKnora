@@ -1,0 +1,264 @@
+name: Build Windows Portable
+
+# WeKnora Lite — Windows 便携版构建
+# 参考上游 release-lite.yml 结构，但产物为便携目录而非 NSIS 安装包。
+# 核心差异：
+#   - wails build 自动处理 desktop+production 标签、图标、资源
+#   - 产物 = WeKnora-Lite.exe + web/ + config/ + migrations/ + jieba-dict/
+#     + duckdb 扩展捆绑 + Start-Portable.bat 启动器
+#   - 扩展从 extensions.duckdb.org 下载（gzip 格式），离线可用
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+env:
+  # WeKnora go.mod 要求 go 1.26.0；wails CLI 必须与项目依赖的 wails/v2 版本一致
+  # （@latest = v2.16.0 要求 go >= 1.25，且可能引入不兼容变更）
+  GO_VERSION: "1.26"
+  NODE_VERSION: "22"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  DUCKDB_VERSION: "v1.5.2"
+  WAILS_CLI_VERSION: "v2.12.0"
+
+jobs:
+  # ── 1. 前端构建（独立 job，产物供桌面构建复用）──
+  build-frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 1
+
+  # ── 2. Windows 桌面应用构建 ──
+  build-desktop:
+    needs: build-frontend
+    runs-on: windows-latest
+    env:
+      CGO_ENABLED: 1
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: frontend-dist
+          path: web/
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_CLI_VERSION }}
+
+      - name: Pre-compile Go packages (warm cache)
+        shell: bash
+        run: |
+          export GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn
+          export CGO_CFLAGS="-Wno-deprecated-declarations"
+          cd cmd/desktop
+          go build -p 1 -buildvcs=false -tags "desktop,sqlite_fts5,production" -o _prebuild_tmp.exe . || true
+          rm -f _prebuild_tmp.exe
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            VERSION="${{ inputs.tag }}"
+          elif [ -n "${GITHUB_REF#refs/tags/}" ] && [ "${GITHUB_REF#refs/tags/}" != "${GITHUB_REF}" ]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="$(git describe --tags --abbrev=0 2>/dev/null || echo dev)"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build desktop app (wails build)
+        shell: bash
+        run: |
+          export EDITION=lite
+          export GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn
+          eval "$(./scripts/get_version.sh env)"
+          LDFLAGS="$(./scripts/get_version.sh ldflags) -X 'google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn'"
+          export CGO_CFLAGS="-Wno-deprecated-declarations"
+
+          bash ./scripts/check-license-bundle.sh
+          cd cmd/desktop
+          wails build -clean \
+            -tags "desktop,sqlite_fts5" \
+            -platform windows/amd64 \
+            -ldflags="${LDFLAGS}" \
+            -o "WeKnora Lite"
+
+      - name: Locate built exe
+        shell: bash
+        run: |
+          # wails build 输出到 cmd/desktop/build/bin/
+          EXE="$(find cmd/desktop/build/bin -maxdepth 1 -name '*.exe' ! -name '*installer*' | head -1)"
+          if [ -z "$EXE" ]; then
+            echo "::error::No exe found in cmd/desktop/build/bin"
+            exit 1
+          fi
+          cp "$EXE" WeKnora-Lite.exe
+          ls -la WeKnora-Lite.exe
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: desktop-exe
+          path: WeKnora-Lite.exe
+          retention-days: 1
+
+  # ── 3. 下载 DuckDB 扩展（独立 job，缓存复用）──
+  fetch-extensions:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download spatial + excel extensions
+        run: |
+          mkdir -p duckdb-home/extensions/${{ env.DUCKDB_VERSION }}/windows_amd64_mingw
+          cd duckdb-home/extensions/${{ env.DUCKDB_VERSION }}/windows_amd64_mingw
+
+          BASE="https://extensions.duckdb.org/${{ env.DUCKDB_VERSION }}/windows_amd64_mingw"
+          for EXT in spatial excel; do
+            echo "Downloading ${EXT}..."
+            # 扩展以 gzip 格式分发（直接 .duckdb_extension URL 返回 404）
+            curl -fSL -o "${EXT}.duckdb_extension.gz" "${BASE}/${EXT}.duckdb_extension.gz"
+            gunzip -f "${EXT}.duckdb_extension.gz"
+          done
+
+          # spatial 的 .info 元数据（INSTALL 版本校验用；缺失时 LOAD 仍可工作）
+          curl -fsSL -o spatial.duckdb_extension.info \
+            "${BASE}/spatial.duckdb_extension.info" || echo "(no spatial .info)"
+
+          ls -la
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: duckdb-extensions
+          path: duckdb-home/
+          retention-days: 1
+
+  # ── 4. 便携打包（合并 exe + 前端 + 扩展 + 启动器）──
+  package-portable:
+    needs: [build-desktop, fetch-extensions]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: desktop-exe
+          path: dist/
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: duckdb-extensions
+          path: dist/
+
+      - name: Assemble portable package
+        run: |
+          cd dist
+
+          # 目录布局（与 Start-Portable.bat 约定一致）
+          mkdir -p data/files config-user logs
+          cp -r ../web .
+          cp -r ../config .
+          cp -r ../migrations .
+          if [ -f ../.env ]; then cp ../.env .; fi
+
+          # jieba 词典：仓库不含，从 gojieba 模块缓存提取
+          # gojieba 把模块缓存路径编译进二进制，跨平台构建必须用 JIEBA_DICT_DIR 重定向
+          GOJIEBA_VERSION=$(grep "yanyiwu/gojieba" ../go.mod | awk '{print $2}')
+          GOJIEBA="$(go env GOMODCACHE)/github.com/yanyiwu/gojieba@${GOJIEBA_VERSION}/deps/cppjieba"
+          if [ -d "$GOJIEBA" ]; then
+            mkdir -p jieba-dict
+            cp "$GOJIEBA"/dict/jieba.dict.utf8 jieba-dict/ 2>/dev/null || true
+            cp "$GOJIEBA"/dict/hmm_model.utf8 jieba-dict/ 2>/dev/null || true
+            cp "$GOJIEBA"/dict/idf.utf8 jieba-dict/ 2>/dev/null || true
+            cp "$GOJIEBA"/dict/stop_words.utf8 jieba-dict/ 2>/dev/null || true
+            cp "$GOJIEBA"/dict/user.dict.utf8 jieba-dict/ 2>/dev/null || true
+            echo "jieba-dict: $(ls jieba-dict | wc -l) files (gojieba ${GOJIEBA_VERSION})"
+          else
+            echo "::warning::gojieba module cache not found at $GOJIEBA"
+          fi
+
+          # 启动器（模板已是 UTF-8 BOM + CRLF，直接复制）
+          cp ../scripts/Start-Portable.bat.template Start-Portable.bat
+
+          echo "=== Portable layout ==="
+          find . -maxdepth 2 -type d | sort
+
+      - name: Package archive
+        run: |
+          VERSION="${{ inputs.tag }}"
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            VERSION="$(git describe --tags --abbrev=0 2>/dev/null || echo latest)"
+          fi
+          ARCHIVE="WeKnora-Lite-portable_windows_amd64_${VERSION}"
+          cd dist
+          zip -r "../${ARCHIVE}.zip" .
+          cd ..
+          sha256sum "${ARCHIVE}.zip" > "${ARCHIVE}.zip.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: WeKnora-Lite-portable-windows-amd64
+          path: |
+            WeKnora-Lite-portable_windows_amd64_*.zip
+            WeKnora-Lite-portable_windows_amd64_*.zip.sha256
+          retention-days: 14
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          gh release create "${VERSION}" \
+            --title "WeKnora Lite ${VERSION} (Windows Portable)" \
+            --notes "Windows 便携版：解压后双击 Start-Portable.bat 运行。所有数据写入本目录。" \
+            WeKnora-Lite-portable_windows_amd64_${VERSION}.zip \
+            WeKnora-Lite-portable_windows_amd64_${VERSION}.zip.sha256
+
+  # ── 5. 完整可执行文件（仅 exe，供高级用户）──
+  upload-exe:
+    needs: build-desktop
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: desktop-exe
+
+      - name: Upload exe to Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/}"
+          gh release upload "${VERSION}" WeKnora-Lite.exe --clobber

@@ -1,0 +1,192 @@
+@echo off
+chcp 65001 >nul
+setlocal enabledelayedexpansion
+
+REM ============================================================
+REM  WeKnora Lite - Windows Portable Launcher with diagnostics
+REM  Keeps data inside this folder and logs where things land.
+REM  Encoding: UTF-8 with BOM, CRLF line endings.
+REM ============================================================
+
+cd /d "%~dp0"
+set "PORTABLE_ROOT=%CD%"
+set "EXE=%PORTABLE_ROOT%\WeKnora-Lite.exe"
+set "LOGDIR=%PORTABLE_ROOT%\logs"
+set "LOGFILE=%LOGDIR%\launch.log"
+
+REM --- 0. Sanity check ---
+if not exist "%EXE%" (
+    echo [ERROR] WeKnora-Lite.exe not found.
+    echo         Keep this .bat next to the .exe.
+    echo         Current dir: %PORTABLE_ROOT%
+    echo.
+    pause
+    exit /b 1
+)
+
+REM --- 1. Portable folder layout ---
+for %%D in ("data" "data\files" "config-user" "logs" "jieba-dict") do (
+    if not exist "%PORTABLE_ROOT%\%%~D" mkdir "%PORTABLE_ROOT%\%%~D"
+)
+
+REM --- 2. Data locations (absolute paths keep them portable) ---
+set "DB_DRIVER=sqlite"
+set "DB_PATH=%PORTABLE_ROOT%\data\weknora.db"
+set "RETRIEVE_DRIVER=sqlite"
+set "STORAGE_TYPE=local"
+set "LOCAL_STORAGE_BASE_DIR=%PORTABLE_ROOT%\data\files"
+set "STREAM_MANAGER_TYPE=memory"
+REM --- 3b. Jieba dict: gojieba bakes the module-cache path into the
+REM        binary at compile time, so a cross-built Windows exe cannot
+REM        find it. Point JIEBA_DICT_DIR at a copy shipped with the app.
+set "JIEBA_DICT_DIR=%PORTABLE_ROOT%\jieba-dict"
+
+REM --- 3c. DuckDB extensions: bundled inside this folder (duckdb-home)
+REM        so xlsx/xls ingest works OFFLINE. The app links the official
+REM        prebuilt duckdb libraries (via the emutls shim) and reads its
+REM        extension cache from DUCKDB_HOME instead of
+REM        %USERPROFILE%\.duckdb, so no download and no writes outside
+REM        this folder are needed.
+set "DUCKDB_HOME=%PORTABLE_ROOT%\duckdb-home"
+
+REM --- 3. Redirect prefs into portable dir (app reads XDG_CONFIG_HOME first) ---
+set "XDG_CONFIG_HOME=%PORTABLE_ROOT%\config-user"
+
+REM --- 4. Run mode ---
+set "GIN_MODE=release"
+
+REM ============================================================
+REM  DIAGNOSTICS - write intended landing spots to log file
+REM ============================================================
+set "STAMP=%date% %time%"
+set "USERCFG=%APPDATA%\WeKnora Lite"
+set "HOMEFILES=%USERPROFILE%\.weknora\data\files"
+
+>> "%LOGFILE%" echo ============================================================
+>> "%LOGFILE%" echo  WeKnora Lite launch - %STAMP%
+>> "%LOGFILE%" echo ============================================================
+>> "%LOGFILE%" echo  App dir      : %PORTABLE_ROOT%
+>> "%LOGFILE%" echo  Database     : %DB_PATH%
+>> "%LOGFILE%" echo  Uploads      : %LOCAL_STORAGE_BASE_DIR%
+>> "%LOGFILE%" echo  Prefs dir    : %XDG_CONFIG_HOME%
+>> "%LOGFILE%" echo  ---- env sent to app ----
+>> "%LOGFILE%" echo  DB_DRIVER              = %DB_DRIVER%
+>> "%LOGFILE%" echo  DB_PATH                = %DB_PATH%
+>> "%LOGFILE%" echo  RETRIEVE_DRIVER        = %RETRIEVE_DRIVER%
+>> "%LOGFILE%" echo  STORAGE_TYPE           = %STORAGE_TYPE%
+>> "%LOGFILE%" echo  LOCAL_STORAGE_BASE_DIR = %LOCAL_STORAGE_BASE_DIR%
+>> "%LOGFILE%" echo  STREAM_MANAGER_TYPE    = %STREAM_MANAGER_TYPE%
+>> "%LOGFILE%" echo  XDG_CONFIG_HOME        = %XDG_CONFIG_HOME%
+>> "%LOGFILE%" echo  GIN_MODE               = %GIN_MODE%
+>> "%LOGFILE%" echo  JIEBA_DICT_DIR         = %JIEBA_DICT_DIR%
+>> "%LOGFILE%" echo  DUCKDB_HOME                = %DUCKDB_HOME%
+>> "%LOGFILE%" echo  ---- spots NOT controlled by this script -----
+>> "%LOGFILE%" echo  signing.key UserConfigDir : %USERCFG%\signing.key
+>> "%LOGFILE%" echo  legacy upload fallback     : %HOMEFILES%
+>> "%LOGFILE%" echo ============================================================
+>> "%LOGFILE%" echo.
+
+echo ============================================================
+echo   WeKnora Lite  (portable)
+echo ============================================================
+echo   App dir   : %PORTABLE_ROOT%
+echo   Database  : %DB_PATH%
+echo   Uploads   : %LOCAL_STORAGE_BASE_DIR%
+echo   Log       : %LOGFILE%
+echo ============================================================
+echo.
+echo Starting... first run may take a while to init the database.
+echo Close this window to quit.
+echo.
+
+REM --- 4b. Pre-flight: the app panics at init() without the dict ---
+if not exist "%JIEBA_DICT_DIR%\jieba.dict.utf8" (
+    echo [ERROR] Jieba dictionary not found at:
+    echo         %JIEBA_DICT_DIR%\jieba.dict.utf8
+    echo         The app aborts at startup without it. Expected 5 files:
+    echo         jieba.dict.utf8 hmm_model.utf8 user.dict.utf8 idf.utf8 stop_words.utf8
+    pause
+    exit /b 1
+)
+
+REM --- 4c. Pre-flight: REDIS_ADDR must stay unset in Lite.
+REM     initRedisClient() pings REDIS_ADDR and panics the whole DI graph when
+REM     the host is unreachable, so a leftover docker-compose line in .env
+REM     ("REDIS_ADDR=redis:6379") aborts startup before any window appears.
+REM     cmd's 'set "X="' deletes the variable rather than defining it empty,
+REM     so it cannot shadow .env here - strip the line instead.
+REM     Note: findstr rewrites the file, so non-ASCII comments in .env may be
+REM     mangled by this repair path. It only runs when REDIS_ADDR is present,
+REM     and comments do not affect runtime values.
+findstr /b /c:"REDIS_ADDR=" /i "%PORTABLE_ROOT%\.env" >nul 2>&1
+if not errorlevel 1 (
+    echo [WARN] .env defines REDIS_ADDR - Lite runs without Redis.
+    echo        Stripping the line to avoid a startup panic.
+    echo.
+    >> "%LOGFILE%" echo [preflight] REDIS_ADDR found in .env - stripped for Lite
+    findstr /b /v /c:"REDIS_ADDR=" /i "%PORTABLE_ROOT%\.env" > "%PORTABLE_ROOT%\.env.lite"
+    move /y "%PORTABLE_ROOT%\.env.lite" "%PORTABLE_ROOT%\.env" >nul
+)
+
+REM --- 5. Launch; capture app stdout+stderr into log ---
+>> "%LOGFILE%" echo Launch time : %time%
+>> "%LOGFILE%" echo ---- app stdout+stderr ----
+"%EXE%" >> "%LOGFILE%" 2>&1
+set "EXITCODE=%ERRORLEVEL%"
+>> "%LOGFILE%" echo ---- end app output, exit %EXITCODE% ----
+>> "%LOGFILE%" echo Exit time   : %time%
+
+REM --- 6. Post-run audit: where did data ACTUALLY land? ---
+call :AUDIT "%JIEBA_DICT_DIR%"           "jieba dict   (required for startup)"
+call :AUDIT "%PORTABLE_ROOT%\duckdb-home\extensions" "duckdb exts   (spatial+excel, offline)"
+call :AUDIT "%DB_PATH%"                  "database     (expected portable)"
+call :AUDIT "%LOCAL_STORAGE_BASE_DIR%"   "uploads      (expected portable)"
+call :AUDIT "%XDG_CONFIG_HOME%"          "prefs dir    (expected portable)"
+call :AUDIT "%USERCFG%\signing.key"      "signing key  (code writes APPDATA, not portable)"
+call :AUDIT "%HOMEFILES%"               "legacy files (should stay empty)"
+
+>> "%LOGFILE%" echo ---- summary ----
+>> "%LOGFILE%" echo  Exit code  : %EXITCODE%
+>> "%LOGFILE%" echo ============================================================
+>> "%LOGFILE%" echo.
+
+echo.
+if not "%EXITCODE%"=="0" (
+    echo [INFO] Exit code: %EXITCODE%
+    if "%EXITCODE%"=="-1073741515" echo        Missing VC++ runtime - install VC_redist.x64.exe
+    if "%EXITCODE%"=="-1073741701" echo        Missing WebView2 runtime - install Edge WebView2
+    echo        See log: %LOGFILE%
+    echo.
+    pause
+) else (
+    echo Exited normally. Audit written to:
+    echo   %LOGFILE%
+    echo.
+    pause
+)
+
+exit /b %EXITCODE%
+
+REM ============================================================
+REM  AUDIT - report whether a path exists and what it holds
+REM  %1 = path   %2 = label
+REM ============================================================
+:AUDIT
+set "APATH=%~1"
+set "ALABEL=%~2"
+set "ACOUNT=n/a"
+set "ASTATE=MISSING"
+
+if exist "%APATH%" (
+    if exist "%APATH%\" (
+        set "ASTATE=DIR"
+        set "ACOUNT=0"
+        for /f %%F in ('dir /b /a-d "%APATH%" 2^>nul ^| find /c /v ""') do set "ACOUNT=%%F"
+    ) else (
+        set "ASTATE=FILE"
+        for %%Z in ("%APATH%") do set "ASIZE=%%~zZ"
+        set "ACOUNT=!ASIZE! bytes"
+    )
+)
+>> "%LOGFILE%" echo  [%ASTATE%] %ALABEL% : %APATH%  (items: %ACOUNT%)
+goto :eof
