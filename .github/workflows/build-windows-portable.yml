@@ -78,11 +78,17 @@ jobs:
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_CLI_VERSION }}
 
+      - name: Install SQLite dev headers (Windows)
+        # sqlite-vec-go-bindings needs sqlite3.h for CGO compilation;
+        # the MSVC toolchain on the runner does not include it.
+        if: runner.os == 'Windows'
+        run: choco install sqlite -y
+
       - name: Pre-compile Go packages (warm cache)
         shell: bash
         run: |
           export GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn
-          export CGO_CFLAGS="-Wno-deprecated-declarations"
+          export CGO_CFLAGS="-Wno-deprecated-declarations -I/c/Program Files/SQLite/include"
           cd cmd/desktop
           go build -p 1 -buildvcs=false -tags "desktop,sqlite_fts5,production" -o _prebuild_tmp.exe . || true
           rm -f _prebuild_tmp.exe
