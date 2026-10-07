@@ -256,6 +256,14 @@ jobs:
       - name: Download gojieba module (for jieba-dict extraction)
         run: go mod download github.com/yanyiwu/gojieba
 
+      # 合规：仓库把第三方许可当作发布门禁（scripts/check-license-bundle.sh），
+      # 上游 release-lite.yml 对每一个产物都调用 copy-licenses.sh，产出
+      # LICENSE + THIRD_PARTY_NOTICES.md + licenses/（含 MPL-2.0 的对应源码 zip）。
+      # 便携包同样是再分发产物，必须带上这份 bundle，否则只发布二进制而缺少
+      # 许可与对应源码。copy-licenses.sh 内部会再跑一次校验，校验不过即失败。
+      - name: Copy license notices + corresponding source
+        run: bash ./scripts/copy-licenses.sh dist
+
       - name: Assemble portable package
         run: |
           cd dist
@@ -286,11 +294,28 @@ jobs:
           # 启动器（模板已是 UTF-8 BOM + CRLF，直接复制）
           cp ../scripts/Start-Portable.bat.template Start-Portable.bat
 
+          # 上游桌面产物会把 .env.lite.example 落成 .env（见 release-lite.yml
+          # macOS 分支的 "${RESOURCES}/.env"）。cmd/desktop/main.go:216 会
+          # godotenv.Load()，而 godotenv 不覆写已存在的环境变量，所以启动器
+          # 显式设置的绝对路径（DB_PATH / LOCAL_STORAGE_BASE_DIR）仍然生效，
+          # 便携性不受影响；.env 只负责补上启动器没设的默认值。
+          cp ../.env.lite.example .env.lite.example
+          cp ../.env.lite.example .env
+
+          # 上游把 docs/LITE.md 作为 README 一并发布
+          cp ../docs/LITE.md README.md
+
           echo "=== Portable layout ==="
           find . -maxdepth 2 -type d | sort
 
       - name: Package archive
         run: |
+          # ubuntu-latest 预装 zip；显式兜底，避免镜像变动让整轮构建白跑
+          if ! command -v zip >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y zip
+          fi
+
           VERSION="${{ inputs.tag }}"
           if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
             # checkout runs with fetch-depth 1 / fetch-tags false, so a tag
