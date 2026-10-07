@@ -145,22 +145,33 @@ jobs:
           # frontend/src/wailsjs and the frontend calls window.go.main.App.*
           # directly (it never imports the generated JS wrappers), so skipping
           # regeneration changes nothing at runtime.
+          # -o 会被原样传给 `go build -o <绝对路径>`，且永不补 .exe：
+          # wails 只在 -o 为空时才加后缀（pkg/commands/build/base.go:123-151），
+          # go 自身同理（cmd/go/internal/work/build.go:473-543，显式 -o 走
+          # p.Target = cfg.BuildO，不追加 ExeSuffix）。启动器约定的是
+          # %PORTABLE_ROOT%\WeKnora-Lite.exe，所以这里必须显式带上 .exe，
+          # 否则产物是无后缀的 `WeKnora-Lite`，下游 find '*.exe' 会落空。
           wails build -clean \
             -skipbindings \
             -tags "desktop,sqlite_fts5" \
             -platform windows/amd64 \
             -ldflags="${LDFLAGS}" \
-            -o WeKnora-Lite
+            -o WeKnora-Lite.exe
 
       - name: Locate built exe
         shell: bash
         run: |
           # wails build 输出到 cmd/desktop/build/bin/
-          EXE="$(find cmd/desktop/build/bin -maxdepth 1 -name '*.exe' ! -name '*installer*' | head -1)"
+          # 先按精确名找，再容忍无后缀/其它 .exe，避免命名差异再次整体失败。
+          EXE="$(find cmd/desktop/build/bin -maxdepth 1 -type f \
+                   \( -name 'WeKnora-Lite.exe' -o -name 'WeKnora-Lite' -o -name '*.exe' \) \
+                   ! -name '*installer*' | head -1)"
           if [ -z "$EXE" ]; then
             echo "::error::No exe found in cmd/desktop/build/bin"
+            ls -la cmd/desktop/build/bin || true
             exit 1
           fi
+          echo "found: $EXE"
           cp "$EXE" WeKnora-Lite.exe
           ls -la WeKnora-Lite.exe
 
