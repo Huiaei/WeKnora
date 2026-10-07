@@ -125,9 +125,28 @@ jobs:
           LDFLAGS="$(./scripts/get_version.sh ldflags) -X 'google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn'"
           export CGO_CFLAGS="-Wno-deprecated-declarations -IC:/sqlite"
 
+          # wails build runs the bindings generator, which imports internal/types
+          # and therefore executes its init() -> newJieba(). With JIEBA_DICT_DIR
+          # unset, gojieba falls back to the module-cache dictionary paths baked
+          # into the package at build time and dies with Exception 0xc0000005
+          # (access violation) on the runner. Point it at the dictionaries that
+          # ship inside the gojieba module instead.
+          go mod download github.com/yanyiwu/gojieba
+          export JIEBA_DICT_DIR="$(go list -m -f '{{.Dir}}' github.com/yanyiwu/gojieba)/deps/cppjieba/dict"
+          echo "JIEBA_DICT_DIR=${JIEBA_DICT_DIR}"
+
           bash ./scripts/check-license-bundle.sh
           cd cmd/desktop
+          # -skipbindings is required on Windows: wails' bindings step builds and
+          # RUNS a temporary wailsbindings.exe that imports the app packages, which
+          # executes internal/types.init() -> newJieba() -> gojieba C code. That
+          # aborts with Exception 0xc0000005 (access violation) on the runner.
+          # The generated bindings are already committed under
+          # frontend/src/wailsjs and the frontend calls window.go.main.App.*
+          # directly (it never imports the generated JS wrappers), so skipping
+          # regeneration changes nothing at runtime.
           wails build -clean \
+            -skipbindings \
             -tags "desktop,sqlite_fts5" \
             -platform windows/amd64 \
             -ldflags="${LDFLAGS}" \
