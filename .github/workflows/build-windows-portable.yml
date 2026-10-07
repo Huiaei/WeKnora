@@ -98,7 +98,7 @@ jobs:
         shell: bash
         run: |
           export GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn
-          export CGO_CFLAGS="-Wno-deprecated-declarations -I/c/sqlite"
+          export CGO_CFLAGS="-Wno-deprecated-declarations -IC:/sqlite"
           cd cmd/desktop
           go build -p 1 -buildvcs=false -tags "desktop,sqlite_fts5,production" -o _prebuild_tmp.exe . || true
           rm -f _prebuild_tmp.exe
@@ -123,7 +123,7 @@ jobs:
           export GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn
           eval "$(./scripts/get_version.sh env)"
           LDFLAGS="$(./scripts/get_version.sh ldflags) -X 'google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn'"
-          export CGO_CFLAGS="-Wno-deprecated-declarations -I/c/sqlite"
+          export CGO_CFLAGS="-Wno-deprecated-declarations -IC:/sqlite"
 
           bash ./scripts/check-license-bundle.sh
           cd cmd/desktop

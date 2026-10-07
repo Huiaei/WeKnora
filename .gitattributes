@@ -1,5 +1,9 @@
 *.sh text eol=lf
 
+# License manifest is parsed with `read` in bash; CRLF would leave a
+# trailing \r on the checksum field and break the 64-hex regex check.
+*.tsv text eol=lf
+
 # Force LF on Go source + JSON golden fixtures so Windows checkouts
 # (with default core.autocrlf=true) don't trip byte-equal comparisons in
 # acceptance/contract envelope tests.
