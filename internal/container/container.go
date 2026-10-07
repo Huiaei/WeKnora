@@ -1784,6 +1784,27 @@ func NewDuckDB() (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}
 
+	// Portable builds ship the spatial/excel extensions inside the package and
+	// point WEKNORA_DUCKDB_EXTENSION_DIR at them. DuckDB reads no environment
+	// variable for the extension location (1.5.2 only getenv's http_proxy,
+	// SLURM_*, USERPROFILE and HOME), so it has to be set with SQL. Once set,
+	// DuckDB never falls back to ~/.duckdb/extensions: LOAD and INSTALL both
+	// use only the configured directory, so nothing is read from or written to
+	// the user profile. Leaving the variable unset keeps upstream behaviour.
+	if extDir := strings.TrimSpace(os.Getenv("WEKNORA_DUCKDB_EXTENSION_DIR")); extDir != "" {
+		// DuckDB accepts forward slashes on Windows; a backslash would need
+		// escaping inside the SQL string literal.
+		setStmt := fmt.Sprintf("SET extension_directory = '%s';",
+			strings.ReplaceAll(extDir, `\`, "/"))
+		if _, err := sqlDB.ExecContext(context.Background(), setStmt); err != nil {
+			logger.Warnf(context.Background(),
+				"[DuckDB] Failed to set extension_directory=%s: %v", extDir, err)
+		} else {
+			logger.Infof(context.Background(),
+				"[DuckDB] Extension directory pinned to %s (portable)", extDir)
+		}
+	}
+
 	// Try to install and load required extensions unless explicitly disabled.
 	//   - spatial: used for st_read_meta() to enumerate layer (sheet) names from .xlsx/.xls
 	//   - excel:   used for read_xlsx() which gives proper type inference per sheet

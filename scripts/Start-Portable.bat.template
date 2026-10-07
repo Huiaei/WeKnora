@@ -5,7 +5,7 @@ setlocal enabledelayedexpansion
 REM ============================================================
 REM  WeKnora Lite - Windows Portable Launcher with diagnostics
 REM  Keeps data inside this folder and logs where things land.
-REM  Encoding: UTF-8 with BOM, CRLF line endings.
+REM  Encoding: ASCII, no BOM (a BOM breaks the first line), CRLF endings.
 REM ============================================================
 
 cd /d "%~dp0"
@@ -41,15 +41,18 @@ REM        binary at compile time, so a cross-built Windows exe cannot
 REM        find it. Point JIEBA_DICT_DIR at a copy shipped with the app.
 set "JIEBA_DICT_DIR=%PORTABLE_ROOT%\jieba-dict"
 
-REM --- 3c. DuckDB extensions: bundled inside this folder (duckdb-home)
-REM        so xlsx/xls ingest works OFFLINE. The app links the official
-REM        prebuilt duckdb libraries (via the emutls shim) and reads its
-REM        extension cache from DUCKDB_HOME instead of
-REM        %USERPROFILE%\.duckdb, so no download and no writes outside
-REM        this folder are needed.
-set "DUCKDB_HOME=%PORTABLE_ROOT%\duckdb-home"
+REM --- 3c. DuckDB extensions: bundled in this folder (duckdb-home) so
+REM        xlsx/xls ingest works OFFLINE and nothing is read from or
+REM        written to %USERPROFILE%\.duckdb. DuckDB has NO environment
+REM        variable for the extension location (1.5.2 only getenv's
+REM        http_proxy, SLURM_*, USERPROFILE and HOME), so the app turns
+REM        this variable into "SET extension_directory = ..." before it
+REM        runs INSTALL/LOAD. Layout: extensions\<ver>\windows_amd64_mingw\
+set "WEKNORA_DUCKDB_EXTENSION_DIR=%PORTABLE_ROOT%\duckdb-home\extensions"
 
-REM --- 3. Redirect prefs into portable dir (app reads XDG_CONFIG_HOME first) ---
+REM --- 3d. Prefs dir. XDG_CONFIG_HOME is honoured by the CLI package; Go's
+REM        os.UserConfigDir() - which the desktop app uses - reads %APPDATA%
+REM        on Windows and ignores XDG, so this only helps other tooling.
 set "XDG_CONFIG_HOME=%PORTABLE_ROOT%\config-user"
 
 REM --- 4. Run mode ---
@@ -61,6 +64,7 @@ REM ============================================================
 set "STAMP=%date% %time%"
 set "USERCFG=%APPDATA%\WeKnora Lite"
 set "HOMEFILES=%USERPROFILE%\.weknora\data\files"
+set "USERDUCKDB=%USERPROFILE%\.duckdb\extensions"
 
 >> "%LOGFILE%" echo ============================================================
 >> "%LOGFILE%" echo  WeKnora Lite launch - %STAMP%
@@ -79,10 +83,11 @@ set "HOMEFILES=%USERPROFILE%\.weknora\data\files"
 >> "%LOGFILE%" echo  XDG_CONFIG_HOME        = %XDG_CONFIG_HOME%
 >> "%LOGFILE%" echo  GIN_MODE               = %GIN_MODE%
 >> "%LOGFILE%" echo  JIEBA_DICT_DIR         = %JIEBA_DICT_DIR%
->> "%LOGFILE%" echo  DUCKDB_HOME                = %DUCKDB_HOME%
+>> "%LOGFILE%" echo  WEKNORA_DUCKDB_EXT_DIR    = %WEKNORA_DUCKDB_EXTENSION_DIR%
 >> "%LOGFILE%" echo  ---- spots NOT controlled by this script -----
 >> "%LOGFILE%" echo  signing.key UserConfigDir : %USERCFG%\signing.key
 >> "%LOGFILE%" echo  legacy upload fallback     : %HOMEFILES%
+>> "%LOGFILE%" echo  duckdb in user profile     : %USERDUCKDB%  (must stay absent)
 >> "%LOGFILE%" echo ============================================================
 >> "%LOGFILE%" echo.
 
@@ -138,11 +143,12 @@ set "EXITCODE=%ERRORLEVEL%"
 
 REM --- 6. Post-run audit: where did data ACTUALLY land? ---
 call :AUDIT "%JIEBA_DICT_DIR%"           "jieba dict   (required for startup)"
-call :AUDIT "%PORTABLE_ROOT%\duckdb-home\extensions" "duckdb exts   (spatial+excel, offline)"
+call :AUDIT "%WEKNORA_DUCKDB_EXTENSION_DIR%" "duckdb exts   (spatial+excel, offline)"
 call :AUDIT "%DB_PATH%"                  "database     (expected portable)"
 call :AUDIT "%LOCAL_STORAGE_BASE_DIR%"   "uploads      (expected portable)"
 call :AUDIT "%XDG_CONFIG_HOME%"          "prefs dir    (expected portable)"
 call :AUDIT "%USERCFG%\signing.key"      "signing key  (code writes APPDATA, not portable)"
+call :AUDIT "%USERDUCKDB%"               "user-profile duckdb (must stay absent)"
 call :AUDIT "%HOMEFILES%"               "legacy files (should stay empty)"
 
 >> "%LOGFILE%" echo ---- summary ----
