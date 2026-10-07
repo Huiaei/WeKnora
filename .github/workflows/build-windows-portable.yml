@@ -198,18 +198,17 @@ jobs:
             gunzip -f "${EXT}.duckdb_extension.gz"
           done
 
-          # spatial 的 .info 元数据（INSTALL 版本校验用；缺失时 LOAD 仍可工作）
-          curl -fsSL -o spatial.duckdb_extension.info \
-            "${BASE}/spatial.duckdb_extension.info" || echo "(no spatial .info)"
-
+          # 不再下载 *.duckdb_extension.info：实测该 URL 在 extensions.duckdb.org
+          # 返回 HTTP 404，1.5.x 的扩展元数据已内嵌在 .duckdb_extension 二进制里。
           ls -la
 
           # upload-artifact roots an uploaded directory at the least common
           # ancestor of the matched files, so `path: duckdb-home/` would NOT
           # keep the duckdb-home/extensions/<ver>/windows_amd64_mingw/ layout
           # (both files live in the same leaf dir, so the prefix is dropped).
-          # The launcher sets DUCKDB_HOME=%PORTABLE_ROOT%\duckdb-home and audits
-          # duckdb-home\extensions, so ship a tarball and keep the layout exact.
+          # The launcher sets WEKNORA_DUCKDB_EXTENSION_DIR to
+          # %PORTABLE_ROOT%\duckdb-home\extensions and the app turns it into
+          # `SET extension_directory = ...`, so the layout must be exact.
           cd "${GITHUB_WORKSPACE}"
           tar czf duckdb-extensions.tar.gz duckdb-home
           tar tzf duckdb-extensions.tar.gz
@@ -279,17 +278,18 @@ jobs:
           # gojieba 把模块缓存路径编译进二进制，跨平台构建必须用 JIEBA_DICT_DIR 重定向
           GOJIEBA_VERSION=$(grep "yanyiwu/gojieba" ../go.mod | awk '{print $2}')
           GOJIEBA="$(go env GOMODCACHE)/github.com/yanyiwu/gojieba@${GOJIEBA_VERSION}/deps/cppjieba"
-          if [ -d "$GOJIEBA" ]; then
-            mkdir -p jieba-dict
-            cp "$GOJIEBA"/dict/jieba.dict.utf8 jieba-dict/ 2>/dev/null || true
-            cp "$GOJIEBA"/dict/hmm_model.utf8 jieba-dict/ 2>/dev/null || true
-            cp "$GOJIEBA"/dict/idf.utf8 jieba-dict/ 2>/dev/null || true
-            cp "$GOJIEBA"/dict/stop_words.utf8 jieba-dict/ 2>/dev/null || true
-            cp "$GOJIEBA"/dict/user.dict.utf8 jieba-dict/ 2>/dev/null || true
-            echo "jieba-dict: $(ls jieba-dict | wc -l) files (gojieba ${GOJIEBA_VERSION})"
-          else
-            echo "::warning::gojieba module cache not found at $GOJIEBA"
+          # gojieba.NewJieba 对任一缺失词典直接 panic，而 internal/types/evaluation.go:13
+          # 是包级 var（init 期就构造），所以这里必须硬校验：否则打包会"成功"，
+          # 用户一启动就崩。5 个文件一个都不能少。
+          if [ ! -d "$GOJIEBA" ]; then
+            echo "::error::gojieba module cache not found at $GOJIEBA"
+            exit 1
           fi
+          mkdir -p jieba-dict
+          for f in jieba.dict.utf8 hmm_model.utf8 idf.utf8 stop_words.utf8 user.dict.utf8; do
+            cp "$GOJIEBA/dict/$f" jieba-dict/ || { echo "::error::missing jieba dict file: $f"; exit 1; }
+          done
+          echo "jieba-dict: $(ls jieba-dict | wc -l) files (gojieba ${GOJIEBA_VERSION})"
 
           # 启动器（模板已是 UTF-8 BOM + CRLF，直接复制）
           cp ../scripts/Start-Portable.bat.template Start-Portable.bat
