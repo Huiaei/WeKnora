@@ -291,7 +291,9 @@ jobs:
           done
           echo "jieba-dict: $(ls jieba-dict | wc -l) files (gojieba ${GOJIEBA_VERSION})"
 
-          # 启动器（模板已是 UTF-8 BOM + CRLF，直接复制）
+          # 启动器模板：ASCII、无 BOM、CRLF，直接复制。
+          # cmd.exe 需要 CRLF；若带 UTF-8 BOM，第一行会变成 BOM+@echo off 而失效，
+          # 所以模板刻意保持无 BOM（见模板 :8 的说明）。
           cp ../scripts/Start-Portable.bat.template Start-Portable.bat
 
           # 上游桌面产物会把 .env.lite.example 落成 .env（见 release-lite.yml
