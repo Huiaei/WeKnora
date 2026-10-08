@@ -4,7 +4,8 @@ setlocal enabledelayedexpansion
 
 REM ============================================================
 REM  WeKnora Lite - Windows Portable Launcher with diagnostics
-REM  Keeps data inside this folder and logs where things land.
+REM  Keeps data inside this folder: it sets the app's paths AND redirects
+REM  USERPROFILE / APPDATA / LOCALAPPDATA here, then logs where things land.
 REM  Encoding: ASCII, no BOM (a BOM breaks the first line), CRLF endings.
 REM ============================================================
 
@@ -25,7 +26,7 @@ if not exist "%EXE%" (
 )
 
 REM --- 1. Portable folder layout ---
-for %%D in ("data" "data\files" "config-user" "logs" "jieba-dict") do (
+for %%D in ("data" "data\files" "config-user" "logs" "jieba-dict" "userprofile" "userprofile\AppData\Roaming" "userprofile\AppData\Local") do (
     if not exist "%PORTABLE_ROOT%\%%~D" mkdir "%PORTABLE_ROOT%\%%~D"
 )
 
@@ -50,10 +51,32 @@ REM        this variable into "SET extension_directory = ..." before it
 REM        runs INSTALL/LOAD. Layout: extensions\<ver>\windows_amd64_mingw\
 set "WEKNORA_DUCKDB_EXTENSION_DIR=%PORTABLE_ROOT%\duckdb-home\extensions"
 
-REM --- 3d. Prefs dir. XDG_CONFIG_HOME is honoured by the CLI package; Go's
-REM        os.UserConfigDir() - which the desktop app uses - reads %APPDATA%
-REM        on Windows and ignores XDG, so this only helps other tooling.
+REM --- 3d. Prefs dir. cmd/desktop/prefs.go checks XDG_CONFIG_HOME FIRST and
+REM        only falls back to os.UserConfigDir() (AppData on Windows), so this
+REM        one line already keeps the prefs file inside the package.
 set "XDG_CONFIG_HOME=%PORTABLE_ROOT%\config-user"
+
+REM --- 3e. User profile redirect. USERPROFILE / APPDATA / LOCALAPPDATA are
+REM        plain environment variables, so pointing them into this folder
+REM        keeps every path the app resolves through them portable. Go's os
+REM        package reads all three directly - os.UserHomeDir() reads
+REM        USERPROFILE, os.UserConfigDir() reads AppData, os.UserCacheDir()
+REM        reads LocalAppData - and has no Known Folder (SHGetFolderPath)
+REM        fallback, so this covers signing.key, the host sandbox app-data
+REM        dir, .weknora\skills and Documents\WeKnoraLite. Native Windows
+REM        APIs still report the real profile, which is harmless because the
+REM        app is pure Go. TEMP and TMP are separate variables and keep
+REM        pointing at the real user temp directory.
+set "REAL_USERPROFILE=%USERPROFILE%"
+set "REAL_APPDATA=%APPDATA%"
+set "REAL_LOCALAPPDATA=%LOCALAPPDATA%"
+REM        internal/sandbox/docker_host.go only falls back to .docker under
+REM        the user profile when DOCKER_CONFIG is unset, so pin it first or
+REM        the user's Docker CLI context becomes invisible.
+if not defined DOCKER_CONFIG if defined REAL_USERPROFILE set "DOCKER_CONFIG=%REAL_USERPROFILE%\.docker"
+set "USERPROFILE=%PORTABLE_ROOT%\userprofile"
+set "APPDATA=%PORTABLE_ROOT%\userprofile\AppData\Roaming"
+set "LOCALAPPDATA=%PORTABLE_ROOT%\userprofile\AppData\Local"
 
 REM --- 4. Run mode ---
 set "GIN_MODE=release"
@@ -62,9 +85,11 @@ REM ============================================================
 REM  DIAGNOSTICS - write intended landing spots to log file
 REM ============================================================
 set "STAMP=%date% %time%"
-set "USERCFG=%APPDATA%\WeKnora Lite"
-set "HOMEFILES=%USERPROFILE%\.weknora\data\files"
-set "USERDUCKDB=%USERPROFILE%\.duckdb\extensions"
+set "USERCFG=%REAL_APPDATA%\WeKnora Lite"
+set "HOMEFILES=%REAL_USERPROFILE%\.weknora\data\files"
+set "USERDUCKDB=%REAL_USERPROFILE%\.duckdb\extensions"
+set "USERSKILLS=%REAL_USERPROFILE%\.weknora\skills"
+set "USERSESSION=%REAL_USERPROFILE%\Documents\WeKnoraLite"
 
 >> "%LOGFILE%" echo ============================================================
 >> "%LOGFILE%" echo  WeKnora Lite launch - %STAMP%
@@ -84,10 +109,18 @@ set "USERDUCKDB=%USERPROFILE%\.duckdb\extensions"
 >> "%LOGFILE%" echo  GIN_MODE               = %GIN_MODE%
 >> "%LOGFILE%" echo  JIEBA_DICT_DIR         = %JIEBA_DICT_DIR%
 >> "%LOGFILE%" echo  WEKNORA_DUCKDB_EXT_DIR    = %WEKNORA_DUCKDB_EXTENSION_DIR%
->> "%LOGFILE%" echo  ---- spots NOT controlled by this script -----
+>> "%LOGFILE%" echo  USERPROFILE            = %USERPROFILE%
+>> "%LOGFILE%" echo  APPDATA                = %APPDATA%
+>> "%LOGFILE%" echo  LOCALAPPDATA           = %LOCALAPPDATA%
+>> "%LOGFILE%" echo  DOCKER_CONFIG          = %DOCKER_CONFIG%
+>> "%LOGFILE%" echo  ---- redirected away from the real profile -----
+>> "%LOGFILE%" echo  real profile was       : %REAL_USERPROFILE%
 >> "%LOGFILE%" echo  signing.key UserConfigDir : %USERCFG%\signing.key
 >> "%LOGFILE%" echo  legacy upload fallback     : %HOMEFILES%
->> "%LOGFILE%" echo  duckdb in user profile     : %USERDUCKDB%  (must stay absent)
+>> "%LOGFILE%" echo  duckdb in user profile     : %USERDUCKDB%
+>> "%LOGFILE%" echo  host skills in profile     : %USERSKILLS%
+>> "%LOGFILE%" echo  host sessions in profile   : %USERSESSION%
+>> "%LOGFILE%" echo  ---- all of the above must stay absent -------
 >> "%LOGFILE%" echo ============================================================
 >> "%LOGFILE%" echo.
 
@@ -147,9 +180,13 @@ call :AUDIT "%WEKNORA_DUCKDB_EXTENSION_DIR%" "duckdb exts   (spatial+excel, offl
 call :AUDIT "%DB_PATH%"                  "database     (expected portable)"
 call :AUDIT "%LOCAL_STORAGE_BASE_DIR%"   "uploads      (expected portable)"
 call :AUDIT "%XDG_CONFIG_HOME%"          "prefs dir    (expected portable)"
-call :AUDIT "%USERCFG%\signing.key"      "signing key  (code writes APPDATA, not portable)"
-call :AUDIT "%USERDUCKDB%"               "user-profile duckdb (must stay absent)"
-call :AUDIT "%HOMEFILES%"               "legacy files (should stay empty)"
+call :AUDIT "%USERPROFILE%"              "portable profile (redirected)"
+call :AUDIT "%APPDATA%"                  "portable appdata (redirected)"
+call :AUDIT "%USERCFG%\signing.key"      "real signing key   (must stay absent)"
+call :AUDIT "%USERDUCKDB%"               "real profile duckdb (must stay absent)"
+call :AUDIT "%HOMEFILES%"               "real profile files (must stay absent)"
+call :AUDIT "%USERSKILLS%"               "real profile skills (must stay absent)"
+call :AUDIT "%USERSESSION%"              "real profile sessions (must stay absent)"
 
 >> "%LOGFILE%" echo ---- summary ----
 >> "%LOGFILE%" echo  Exit code  : %EXITCODE%
