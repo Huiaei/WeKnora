@@ -10,6 +10,14 @@
 *.go text eol=lf
 cli/acceptance/testdata/**/*.json text eol=lf
 
+# Windows batch files are committed with CRLF and must stay byte-identical:
+# cmd.exe misparses `goto :label` and parenthesised blocks in an LF-only
+# script, and scripts/Start-Portable.bat.template is copied straight into the
+# portable zip. `-text` disables all EOL conversion, so every checkout gets
+# the committed bytes regardless of core.autocrlf.
+*.bat -text
+*.bat.template -text
+
 # Trellis: append-only developer journals should merge cleanly across
 # parallel sessions/worktrees — each session only appends a new block, so
 # there is nothing to actually conflict on.
