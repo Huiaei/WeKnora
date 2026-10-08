@@ -176,7 +176,7 @@ set "EXITCODE=%ERRORLEVEL%"
 
 REM --- 6. Post-run audit: where did data ACTUALLY land? ---
 call :AUDIT "%JIEBA_DICT_DIR%"           "jieba dict   (required for startup)"
-call :AUDIT "%WEKNORA_DUCKDB_EXTENSION_DIR%" "duckdb exts   (spatial+excel, offline)"
+call :AUDIT "%WEKNORA_DUCKDB_EXTENSION_DIR%" "duckdb exts   (spatial+excel, offline)" R
 call :AUDIT "%DB_PATH%"                  "database     (expected portable)"
 call :AUDIT "%LOCAL_STORAGE_BASE_DIR%"   "uploads      (expected portable)"
 call :AUDIT "%XDG_CONFIG_HOME%"          "prefs dir    (expected portable)"
@@ -212,11 +212,12 @@ exit /b %EXITCODE%
 
 REM ============================================================
 REM  AUDIT - report whether a path exists and what it holds
-REM  %1 = path   %2 = label
+REM  %1 = path   %2 = label   %3 = R to count files recursively
 REM ============================================================
 :AUDIT
 set "APATH=%~1"
 set "ALABEL=%~2"
+set "AMODE=%~3"
 set "ACOUNT=n/a"
 set "ASTATE=MISSING"
 
@@ -224,7 +225,14 @@ if exist "%APATH%" (
     if exist "%APATH%\" (
         set "ASTATE=DIR"
         set "ACOUNT=0"
-        for /f %%F in ('dir /b /a-d "%APATH%" 2^>nul ^| find /c /v ""') do set "ACOUNT=%%F"
+        REM  duckdb-home\extensions keeps the extensions one level down
+        REM  (extensions\<ver>\windows_amd64_mingw\), so a plain listing
+        REM  reports 0 items; those callers pass R to count the whole tree.
+        if /i "%AMODE%"=="R" (
+            for /f %%F in ('dir /b /s /a-d "%APATH%" 2^>nul ^| find /c /v ""') do set "ACOUNT=%%F"
+        ) else (
+            for /f %%F in ('dir /b /a-d "%APATH%" 2^>nul ^| find /c /v ""') do set "ACOUNT=%%F"
+        )
     ) else (
         set "ASTATE=FILE"
         for %%Z in ("%APATH%") do set "ASIZE=%%~zZ"
