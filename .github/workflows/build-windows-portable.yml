@@ -340,6 +340,9 @@ jobs:
           CGO_ENABLED=1 CGO_CFLAGS="-Wno-deprecated-declarations" \
             go build -tags sqlite_fts5 -o /tmp/weknora-diag ./cmd/diag/
 
+          # 每次都从干净的目录开始：迁移断言依赖「从零迁到最新」这条日志，
+          # 复用旧库会让第二次运行误报「migrations did not run」。
+          rm -rf /tmp/weknora-smoke
           mkdir -p /tmp/weknora-smoke/files
           set +e
           DB_DRIVER=sqlite DB_PATH=/tmp/weknora-smoke/weknora.db \
@@ -349,6 +352,9 @@ jobs:
             timeout 300 /tmp/weknora-diag > /tmp/weknora-smoke/diag.log 2>&1
           rc=$?
           set -e
+          echo "--- diag log head ---"
+          head -8 /tmp/weknora-smoke/diag.log
+          echo "--- diag log tail ---"
           tail -20 /tmp/weknora-smoke/diag.log
 
           [ "$rc" -eq 0 ] || { echo "::error::cmd/diag exited $rc - the container crashes at startup"; exit 1; }
@@ -358,6 +364,18 @@ jobs:
             { echo "::error::migrations did not run"; exit 1; }
           test -s /tmp/weknora-smoke/weknora.db ||
             { echo "::error::sqlite database was not created"; exit 1; }
+          # cmd/diag 现在与 cmd/desktop 一样把进程标记为 Lite；router.go 只在
+          # Edition == "lite" 时才注册 SPA 处理器，所以这一行同时证明了 Lite 分支
+          # 真的走到了 —— 而不是偷偷跑了 standard 配置。
+          grep -q 'edition=lite' /tmp/weknora-smoke/diag.log ||
+            { echo "::error::diag did not run in Lite mode"; exit 1; }
+          # 前端已在前面下载到 web/；若在，SPA 处理器就必须注册成功
+          if [ -f web/index.html ]; then
+            grep -q 'Serving frontend static files' /tmp/weknora-smoke/diag.log ||
+              { echo "::error::web/index.html exists but the Lite SPA handler did not register"; exit 1; }
+          else
+            echo "::warning::web/index.html absent - skipping the SPA handler assertion"
+          fi
           echo "container smoke test passed"
 
       # 合规：仓库把第三方许可当作发布门禁（scripts/check-license-bundle.sh），

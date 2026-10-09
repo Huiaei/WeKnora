@@ -14,12 +14,21 @@ import (
 
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/container"
+	"github.com/Tencent/WeKnora/internal/handler"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/runtime"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
 func main() {
+	// Mirror cmd/desktop's ensureDesktopLiteEdition(). The desktop entry marks
+	// the process as Lite at runtime (packaged builds also inject it via
+	// ldflags), and router.go only registers the SPA handler when
+	// Edition == "lite". Without this the probe would silently exercise the
+	// standard configuration and skip exactly the static-file path the
+	// portable package depends on.
+	handler.Edition = "lite"
+
 	logger.ConfigureFromEnv()
 
 	step := func(format string, a ...any) {
@@ -27,6 +36,7 @@ func main() {
 		os.Stdout.Sync()
 	}
 
+	step("edition=%s", handler.Edition)
 	step("BuildContainer: start")
 	c := container.BuildContainer(runtime.GetContainer())
 	step("BuildContainer: done")
