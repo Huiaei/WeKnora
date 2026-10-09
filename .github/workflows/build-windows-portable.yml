@@ -355,24 +355,48 @@ jobs:
         with:
           fetch-depth: 1
 
-      # 两个产物都是 archive: false 上传的单文件，下载后就是原始文件本身
+      # 两个产物都是 archive: false 上传的单文件，下载后就是原始文件本身。
+      # merge-multiple: true 让它们直接落在 release-assets/ 根下；默认的 false
+      # 会再套一层以产物名命名的目录（release-assets/<artifact>/<file>），
+      # 那样下面按文件名定位就会落空 —— run 37931473095 正是死在这里。
       - uses: actions/download-artifact@v8
         with:
           name: WeKnora-Lite-portable_windows_amd64.zip
           path: release-assets/
+          merge-multiple: true
 
       - uses: actions/download-artifact@v8
         with:
           name: WeKnora-Lite.exe
           path: release-assets/
+          merge-multiple: true
 
       - name: Compute checksum
-        working-directory: release-assets
         run: |
-          # 对「实际拿到的字节」计算，保证 Release 上的 .sha256 与 .zip 严格对应
-          sha256sum WeKnora-Lite-portable_windows_amd64.zip \
-            > WeKnora-Lite-portable_windows_amd64.zip.sha256
-          cat WeKnora-Lite-portable_windows_amd64.zip.sha256
+          # 对「实际拿到的字节」计算，保证 Release 上的 .sha256 与 .zip 严格对应。
+          # 不假设 zip 落在 release-assets/ 的哪一层：先定位再算，并把整棵树打印
+          # 出来 —— 万一还是找不到，日志里直接能看到真实布局，不用再猜。
+          mkdir -p release-assets
+          echo "=== release-assets tree ==="
+          find release-assets -type f -printf '%10s  %p\n' | sort -k2
+
+          ZIP="$(find release-assets -type f -name 'WeKnora-Lite-portable_windows_amd64.zip' | head -1)"
+          if [ -z "$ZIP" ]; then
+            # 产物名万一被改动（例如多加了一层 .zip），退一步取任意 zip
+            ZIP="$(find release-assets -type f -name '*.zip' | head -1)"
+          fi
+          if [ -z "$ZIP" ]; then
+            echo "::error::portable zip not found under release-assets/"
+            exit 1
+          fi
+          echo "checksum target: $ZIP"
+
+          HASH="$(sha256sum "$ZIP" | awk '{print $1}')"
+          # 校验文件里写裸文件名：用户把 zip 和 .sha256 放同一目录后
+          # `sha256sum -c` 就能直接用
+          printf '%s  %s\n' "$HASH" 'WeKnora-Lite-portable_windows_amd64.zip' \
+            > release-assets/WeKnora-Lite-portable_windows_amd64.zip.sha256
+          cat release-assets/WeKnora-Lite-portable_windows_amd64.zip.sha256
 
       - name: Publish (create or overwrite)
         env:
