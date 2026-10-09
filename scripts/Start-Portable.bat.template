@@ -120,7 +120,7 @@ set "USERSESSION=%REAL_USERPROFILE%\Documents\WeKnoraLite"
 >> "%LOGFILE%" echo  duckdb in user profile     : %USERDUCKDB%
 >> "%LOGFILE%" echo  host skills in profile     : %USERSKILLS%
 >> "%LOGFILE%" echo  host sessions in profile   : %USERSESSION%
->> "%LOGFILE%" echo  ---- all of the above must stay absent -------
+>> "%LOGFILE%" echo  ---- the five paths above must not be modified by this run ----
 >> "%LOGFILE%" echo ============================================================
 >> "%LOGFILE%" echo.
 
@@ -166,6 +166,16 @@ if not errorlevel 1 (
     move /y "%PORTABLE_ROOT%\.env.lite" "%PORTABLE_ROOT%\.env" >nul
 )
 
+REM --- 4d. Fingerprint the real-profile paths BEFORE the app runs, so the
+REM         audit can say whether THIS run modified them instead of merely
+REM         listing them. They may already exist from an earlier native
+REM         install, which is fine - being old is not a leak.
+call :STAMP "%USERCFG%\signing.key" B4_SIGN
+call :STAMP "%USERDUCKDB%"          B4_DUCK
+call :STAMP "%HOMEFILES%"           B4_FILES
+call :STAMP "%USERSKILLS%"          B4_SKILLS
+call :STAMP "%USERSESSION%"         B4_SESS
+
 REM --- 5. Launch; capture app stdout+stderr into log ---
 >> "%LOGFILE%" echo Launch time : %time%
 >> "%LOGFILE%" echo ---- app stdout+stderr ----
@@ -178,15 +188,17 @@ REM --- 6. Post-run audit: where did data ACTUALLY land? ---
 call :AUDIT "%JIEBA_DICT_DIR%"           "jieba dict   (required for startup)"
 call :AUDIT "%WEKNORA_DUCKDB_EXTENSION_DIR%" "duckdb exts   (spatial+excel, offline)" R
 call :AUDIT "%DB_PATH%"                  "database     (expected portable)"
-call :AUDIT "%LOCAL_STORAGE_BASE_DIR%"   "uploads      (expected portable)"
-call :AUDIT "%XDG_CONFIG_HOME%"          "prefs dir    (expected portable)"
-call :AUDIT "%USERPROFILE%"              "portable profile (redirected)"
-call :AUDIT "%APPDATA%"                  "portable appdata (redirected)"
-call :AUDIT "%USERCFG%\signing.key"      "real signing key   (must stay absent)"
-call :AUDIT "%USERDUCKDB%"               "real profile duckdb (must stay absent)"
-call :AUDIT "%HOMEFILES%"               "real profile files (must stay absent)"
-call :AUDIT "%USERSKILLS%"               "real profile skills (must stay absent)"
-call :AUDIT "%USERSESSION%"              "real profile sessions (must stay absent)"
+call :AUDIT "%LOCAL_STORAGE_BASE_DIR%"   "uploads      (expected portable)" R
+call :AUDIT "%XDG_CONFIG_HOME%"          "prefs dir    (expected portable)" R
+call :AUDIT "%USERPROFILE%"              "portable profile (redirected)" R
+call :AUDIT "%APPDATA%"                  "portable appdata (redirected)" R
+REM --- 6b. Real user profile: it must not be touched by this run. The stamps
+REM         were taken before launch, so this is a comparison, not a guess.
+call :REALAUDIT "%USERCFG%\signing.key" "real signing key"    "%B4_SIGN%"
+call :REALAUDIT "%USERDUCKDB%"          "real profile duckdb" "%B4_DUCK%"
+call :REALAUDIT "%HOMEFILES%"           "real profile files"  "%B4_FILES%"
+call :REALAUDIT "%USERSKILLS%"          "real profile skills" "%B4_SKILLS%"
+call :REALAUDIT "%USERSESSION%"         "real profile sessions" "%B4_SESS%"
 
 >> "%LOGFILE%" echo ---- summary ----
 >> "%LOGFILE%" echo  Exit code  : %EXITCODE%
@@ -240,4 +252,49 @@ if exist "%APATH%" (
     )
 )
 >> "%LOGFILE%" echo  [%ASTATE%] %ALABEL% : %APATH%  (items: %ACOUNT%)
+goto :eof
+
+REM ============================================================
+REM  STAMP - fingerprint a path for a before/after comparison
+REM  %1 = path   %2 = variable that receives the fingerprint, or ABSENT
+REM  A file is fingerprinted by its timestamp + size; a directory by its
+REM  timestamp + the number of files anywhere under it. The timestamp
+REM  only resolves to the minute, so a change made within the same minute
+REM  would otherwise be invisible - the file count closes that gap. The
+REM  audit prints the absolute timestamp too, so a human can compare it
+REM  with the launch time in the same log.
+REM ============================================================
+:STAMP
+set "%~2=ABSENT"
+if not exist "%~1" goto :eof
+if exist "%~1\" (
+    set "SCOUNT=0"
+    for /f %%F in ('dir /b /s /a-d "%~1" 2^>nul ^| find /c /v ""') do set "SCOUNT=%%F"
+    for %%S in ("%~1") do set "%~2=%%~tS~!SCOUNT! files"
+) else (
+    for %%S in ("%~1") do set "%~2=%%~tS~%%~zS bytes"
+)
+goto :eof
+
+REM ============================================================
+REM  REALAUDIT - did this run write into the real user profile?
+REM  %1 = path   %2 = label   %3 = stamp taken before the app started
+REM  These paths may legitimately exist from an earlier native install;
+REM  what matters is whether THIS run modified them.
+REM ============================================================
+:REALAUDIT
+call :STAMP "%~1" AFT
+if "%~3"=="ABSENT" (
+    if "!AFT!"=="ABSENT" (
+        >> "%LOGFILE%" echo  [absent]    %~2 : %~1  -- absent before and after
+    ) else (
+        >> "%LOGFILE%" echo  [CREATED]   %~2 : %~1  -- created by this run, last write !AFT!
+    )
+) else (
+    if "!AFT!"=="%~3" (
+        >> "%LOGFILE%" echo  [untouched] %~2 : %~1  -- pre-existing, not modified; last write !AFT!
+    ) else (
+        >> "%LOGFILE%" echo  [CHANGED]   %~2 : %~1  -- before %~3  now !AFT!
+    )
+)
 goto :eof
