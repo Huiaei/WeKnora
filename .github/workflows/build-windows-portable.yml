@@ -174,8 +174,10 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: desktop-exe
+          # archive: false -> 直接把 exe 当产物上传，不再被套一层 zip（从 Actions
+          # 页面下载即得原始 exe）。此时 name 参数被忽略，产物名 = 文件名。
           path: WeKnora-Lite.exe
+          archive: false
           retention-days: 1
 
   # ── 3. 下载 DuckDB 扩展（独立 job，缓存复用）──
@@ -212,8 +214,11 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: duckdb-extensions
+          # archive: false -> 直接上传 tar.gz 本身（单文件），不再被套一层 zip；
+          # 下载方拿到的是原始 tar.gz，解包后目录结构不变。name 被忽略，
+          # 产物名 = duckdb-extensions.tar.gz。
           path: duckdb-extensions.tar.gz
+          archive: false
           retention-days: 1
 
   # ── 4. 便携打包（合并 exe + 前端 + 扩展 + 启动器）──
@@ -229,7 +234,7 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          name: desktop-exe
+          name: WeKnora-Lite.exe
           path: dist/
 
       # The portable package must ship the SPA: the backend serves it from
@@ -243,7 +248,7 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          name: duckdb-extensions
+          name: duckdb-extensions.tar.gz
           path: exts/
 
       - name: Unpack DuckDB extensions
@@ -323,15 +328,18 @@ jobs:
           cd dist
           zip -r "../${ARCHIVE}.zip" .
           cd ..
-          sha256sum "${ARCHIVE}.zip" > "${ARCHIVE}.zip.sha256"
-          ls -la "${ARCHIVE}.zip" "${ARCHIVE}.zip.sha256"
+          # 这里只打印校验值供日志核对；Release 上的 .sha256 在 publish-release
+          # 里对「实际下载到的字节」重算，保证与 Release 文件严格对应。
+          sha256sum "${ARCHIVE}.zip"
+          ls -la "${ARCHIVE}.zip"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: WeKnora-Lite-portable-windows-amd64
-          path: |
-            WeKnora-Lite-portable_windows_amd64.zip
-            WeKnora-Lite-portable_windows_amd64.zip.sha256
+          # archive: false -> 产物就是那个 zip 本身。否则 upload-artifact 会再压
+          # 一层，从 Actions 页面下载得到「zip 套 zip」，要解两次。name 被忽略，
+          # 产物名 = WeKnora-Lite-portable_windows_amd64.zip。
+          path: WeKnora-Lite-portable_windows_amd64.zip
+          archive: false
           retention-days: 14
 
   # ── 5. 发布到固定的 Release（每次覆盖，下载链接长期稳定）──
@@ -347,15 +355,24 @@ jobs:
         with:
           fetch-depth: 1
 
+      # 两个产物都是 archive: false 上传的单文件，下载后就是原始文件本身
       - uses: actions/download-artifact@v8
         with:
-          name: WeKnora-Lite-portable-windows-amd64
+          name: WeKnora-Lite-portable_windows_amd64.zip
           path: release-assets/
 
       - uses: actions/download-artifact@v8
         with:
-          name: desktop-exe
+          name: WeKnora-Lite.exe
           path: release-assets/
+
+      - name: Compute checksum
+        working-directory: release-assets
+        run: |
+          # 对「实际拿到的字节」计算，保证 Release 上的 .sha256 与 .zip 严格对应
+          sha256sum WeKnora-Lite-portable_windows_amd64.zip \
+            > WeKnora-Lite-portable_windows_amd64.zip.sha256
+          cat WeKnora-Lite-portable_windows_amd64.zip.sha256
 
       - name: Publish (create or overwrite)
         env:
