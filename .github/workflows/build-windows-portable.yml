@@ -232,10 +232,14 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
+      # merge-multiple: true 让产物直接落在目标目录下；默认的 false 在某些产物形态
+      # 下会再套一层以产物名命名的目录。紧跟其后的归一化步骤与它互为保险 —— 后面的
+      # 组装步骤依赖 dist/WeKnora-Lite.exe 这个名字。
       - uses: actions/download-artifact@v8
         with:
           name: WeKnora-Lite.exe
           path: dist/
+          merge-multiple: true
 
       # The portable package must ship the SPA: the backend serves it from
       # ./web (internal/router/static.go), and the assembly below copies
@@ -245,11 +249,49 @@ jobs:
         with:
           name: frontend-dist
           path: web/
+          merge-multiple: true
 
       - uses: actions/download-artifact@v8
         with:
           name: duckdb-extensions.tar.gz
           path: exts/
+          merge-multiple: true
+
+      - name: Normalize downloaded artifacts
+        run: |
+          # 不假设 download-artifact 的落点：把 exe 与 tar.gz 都定位出来并归位到
+          # 后面几步依赖的路径上。run 37931473095 里 publish-release 就死在
+          # 「假设产物落在根下」，同一个假设这里也有一份。
+          echo "=== what the downloads actually produced ==="
+          find dist exts -maxdepth 2 -printf '%y %10s  %p\n' | sort -k3
+
+          if [ ! -f dist/WeKnora-Lite.exe ]; then
+            src="$(find dist -type f -name 'WeKnora-Lite.exe' | head -1)"
+            [ -n "$src" ] || src="$(find dist -type f -name '*.exe' | head -1)"
+            if [ -z "$src" ]; then
+              echo "::error::desktop exe not found under dist/ after download"
+              exit 1
+            fi
+            echo "relocating $src -> dist/WeKnora-Lite.exe"
+            cp -f "$src" dist/.exe.tmp
+            rm -rf dist/WeKnora-Lite.exe      # 可能是同名目录
+            mv -f dist/.exe.tmp dist/WeKnora-Lite.exe
+          fi
+
+          if [ ! -f exts/duckdb-extensions.tar.gz ]; then
+            src="$(find exts -type f -name 'duckdb-extensions.tar.gz' | head -1)"
+            [ -n "$src" ] || src="$(find exts -type f -name '*.tar.gz' | head -1)"
+            if [ -z "$src" ]; then
+              echo "::error::duckdb extensions archive not found under exts/"
+              exit 1
+            fi
+            echo "relocating $src -> exts/duckdb-extensions.tar.gz"
+            cp -f "$src" exts/.tgz.tmp
+            rm -rf exts/duckdb-extensions.tar.gz
+            mv -f exts/.tgz.tmp exts/duckdb-extensions.tar.gz
+          fi
+
+          ls -la dist/WeKnora-Lite.exe exts/duckdb-extensions.tar.gz
 
       - name: Unpack DuckDB extensions
         run: tar xzf exts/duckdb-extensions.tar.gz -C dist/
@@ -311,6 +353,65 @@ jobs:
 
           echo "=== Portable layout ==="
           find . -maxdepth 2 -type d | sort
+
+      - name: Verify portable layout
+        working-directory: dist
+        run: |
+          # 打包前先验一遍便携包结构。这里失败远好于用户解压、双击
+          # Start-Portable.bat 才发现 exe 不在根目录 —— package-portable 是
+          # 全绿也说明不了包是对的，只有断言才能。
+          fail=0
+          need_file() {
+            local p="$1" min="${2:-0}" sz=0
+            if [ ! -f "$p" ]; then echo "::error::missing file: dist/$p"; fail=1; return; fi
+            sz=$(stat -c%s "$p")
+            if [ "$sz" -lt "$min" ]; then
+              echo "::error::dist/$p is only $sz bytes (expected >= $min)"; fail=1; return
+            fi
+            echo "ok   file  $p  ($sz B)"
+          }
+          need_dir() {
+            local p="$1" n=0
+            if [ ! -d "$p" ]; then echo "::error::missing dir: dist/$p"; fail=1; return; fi
+            n=$(find "$p" -type f | wc -l)
+            if [ "$n" -eq 0 ]; then echo "::error::empty dir: dist/$p"; fail=1; return; fi
+            echo "ok   dir   $p  ($n files)"
+          }
+
+          # exe 必须是文件而不是同名目录：archive: false 的产物若被解成目录就会这样
+          if [ -d WeKnora-Lite.exe ]; then
+            echo "::error::dist/WeKnora-Lite.exe is a DIRECTORY - download-artifact nested it"
+            fail=1
+          fi
+          need_file WeKnora-Lite.exe 50000000
+          need_file Start-Portable.bat
+          need_file .env
+          need_file README.md
+          need_file LICENSE
+          need_file THIRD_PARTY_NOTICES.md
+          need_file duckdb-home/extensions/v1.5.2/windows_amd64_mingw/spatial.duckdb_extension
+          need_file duckdb-home/extensions/v1.5.2/windows_amd64_mingw/excel.duckdb_extension
+          need_dir web
+          need_dir config
+          need_dir migrations
+          need_dir jieba-dict
+          need_dir licenses
+
+          jieba_n=$(find jieba-dict -type f | wc -l)
+          [ "$jieba_n" -eq 5 ] || { echo "::error::jieba-dict should hold 5 files, got $jieba_n"; fail=1; }
+
+          # 启动器必须 ASCII + CRLF：带 BOM 第一行会失效，LF 会被 cmd.exe 误读
+          ft=$(file -b Start-Portable.bat)
+          echo "Start-Portable.bat: $ft"
+          case "$ft" in *CRLF*) ;; *) echo "::error::Start-Portable.bat lost its CRLF line endings"; fail=1 ;; esac
+          case "$ft" in *ASCII*) ;; *) echo "::error::Start-Portable.bat is not ASCII (BOM or non-ASCII byte)"; fail=1 ;; esac
+
+          if [ "$fail" -ne 0 ]; then
+            echo "=== dist tree (maxdepth 3) ==="
+            find . -maxdepth 3 -printf '%y %10s  %p\n' | sort -k3 | head -60
+            exit 1
+          fi
+          echo "portable layout verified"
 
       - name: Package archive
         run: |
@@ -378,8 +479,12 @@ jobs:
           # 目录。run 37931473095 就是死在「假设它落在 release-assets/ 根下」。
           # 这里先全盘定位两个产物、统一收进 release-assets/，并把真实布局打出来。
           mkdir -p release-assets
-          echo "=== workspace top level (maxdepth 2) ==="
-          find . -maxdepth 2 -path ./.git -prune -o -type f -printf '%10s  %p\n' | sort -k2 | head -30
+          # 先把产物区完整打出来（不截断），再看一眼工作区顶层。上一轮正是因为
+          # 清单被 head 截断，真实布局反而没进日志。
+          echo "=== release-assets (recursive) ==="
+          find release-assets -printf '%y %10s  %p\n' | sort -k3
+          echo "=== workspace top level (maxdepth 2, first 25) ==="
+          find . -maxdepth 2 -path ./.git -prune -o -type f -printf '%10s  %p\n' | sort -k2 | head -25
 
           collect() {   # $1 = 期望文件名, $2 = 兜底通配
             local want="$1" glob="$2" src=""
@@ -387,7 +492,10 @@ jobs:
               echo "in place : $want"
               return 0
             fi
-            src="$(find . -path ./.git -prune -o -type f -name "$want" -print | head -1)"
+            # 先只在产物区里找（避免命中 checkout 里的同名文件），找不到再退到全工作区
+            src="$(find release-assets -type f -name "$want" | head -1)"
+            [ -n "$src" ] || src="$(find release-assets -type f -name "$glob" | head -1)"
+            [ -n "$src" ] || src="$(find . -path ./.git -prune -o -type f -name "$want" -print | head -1)"
             [ -n "$src" ] || src="$(find . -path ./.git -prune -o -type f -name "$glob" -print | head -1)"
             if [ -z "$src" ]; then
               echo "::warning::could not locate $want anywhere in the workspace"
