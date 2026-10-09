@@ -279,14 +279,20 @@ jobs:
           # 不假设 download-artifact 的落点：把 exe 与 tar.gz 都定位出来并归位到
           # 后面几步依赖的路径上。run 37931473095 里 publish-release 就死在
           # 「假设产物落在根下」，同一个假设这里也有一份。
+          # 先建目录再 find：万一下载根本没建出 dist/ 或 exts/，下面的 find 会
+          # 非零退出（配合 -e 直接失败），反而走不到真正的救援逻辑。
+          mkdir -p dist exts
           echo "=== what the downloads actually produced ==="
           find dist exts -maxdepth 2 -printf '%y %10s  %p\n' | sort -k3
 
           if [ ! -f dist/WeKnora-Lite.exe ]; then
+            # 先找 dist/，再退到整个工作区 —— 产物有可能根本没落在 path 下
             src="$(find dist -type f -name 'WeKnora-Lite.exe' | head -1)"
             [ -n "$src" ] || src="$(find dist -type f -name '*.exe' | head -1)"
+            [ -n "$src" ] || src="$(find . -path ./.git -prune -o -type f -name 'WeKnora-Lite.exe' -print | head -1)"
+            [ -n "$src" ] || src="$(find . -path ./.git -prune -o -type f -name '*.exe' -print | head -1)"
             if [ -z "$src" ]; then
-              echo "::error::desktop exe not found under dist/ after download"
+              echo "::error::desktop exe not found under dist/ nor anywhere in the workspace"
               exit 1
             fi
             echo "relocating $src -> dist/WeKnora-Lite.exe"
@@ -298,8 +304,10 @@ jobs:
           if [ ! -f exts/duckdb-extensions.tar.gz ]; then
             src="$(find exts -type f -name 'duckdb-extensions.tar.gz' | head -1)"
             [ -n "$src" ] || src="$(find exts -type f -name '*.tar.gz' | head -1)"
+            [ -n "$src" ] || src="$(find . -path ./.git -prune -o -type f -name 'duckdb-extensions.tar.gz' -print | head -1)"
+            [ -n "$src" ] || src="$(find . -path ./.git -prune -o -type f -name '*.tar.gz' -print | head -1)"
             if [ -z "$src" ]; then
-              echo "::error::duckdb extensions archive not found under exts/"
+              echo "::error::duckdb extensions archive not found under exts/ nor anywhere in the workspace"
               exit 1
             fi
             echo "relocating $src -> exts/duckdb-extensions.tar.gz"
