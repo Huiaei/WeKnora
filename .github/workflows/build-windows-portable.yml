@@ -371,27 +371,56 @@ jobs:
           path: release-assets/
           merge-multiple: true
 
-      - name: Compute checksum
+      - name: Collect assets + compute checksum
         run: |
-          # 对「实际拿到的字节」计算，保证 Release 上的 .sha256 与 .zip 严格对应。
-          # 不假设 zip 落在 release-assets/ 的哪一层：先定位再算，并把整棵树打印
-          # 出来 —— 万一还是找不到，日志里直接能看到真实布局，不用再猜。
+          # 不猜 download-artifact 把文件放在哪：archive: false 的单文件产物并没有把
+          # path 语义写进文档，merge-multiple 默认 false 又可能套一层以产物名命名的
+          # 目录。run 37931473095 就是死在「假设它落在 release-assets/ 根下」。
+          # 这里先全盘定位两个产物、统一收进 release-assets/，并把真实布局打出来。
           mkdir -p release-assets
-          echo "=== release-assets tree ==="
-          find release-assets -type f -printf '%10s  %p\n' | sort -k2
+          echo "=== workspace top level (maxdepth 2) ==="
+          find . -maxdepth 2 -path ./.git -prune -o -type f -printf '%10s  %p\n' | sort -k2 | head -30
 
-          ZIP="$(find release-assets -type f -name 'WeKnora-Lite-portable_windows_amd64.zip' | head -1)"
-          if [ -z "$ZIP" ]; then
-            # 产物名万一被改动（例如多加了一层 .zip），退一步取任意 zip
-            ZIP="$(find release-assets -type f -name '*.zip' | head -1)"
-          fi
-          if [ -z "$ZIP" ]; then
-            echo "::error::portable zip not found under release-assets/"
+          collect() {   # $1 = 期望文件名, $2 = 兜底通配
+            local want="$1" glob="$2" src=""
+            if [ -f "release-assets/$want" ]; then
+              echo "in place : $want"
+              return 0
+            fi
+            src="$(find . -path ./.git -prune -o -type f -name "$want" -print | head -1)"
+            [ -n "$src" ] || src="$(find . -path ./.git -prune -o -type f -name "$glob" -print | head -1)"
+            if [ -z "$src" ]; then
+              echo "::warning::could not locate $want anywhere in the workspace"
+              return 0
+            fi
+            echo "collected: $src -> release-assets/$want"
+            # 先搬到临时名：src 有可能就在 release-assets/<want>/ 里面，
+            # 直接 rm -rf 那个目录会把源文件一起删掉。
+            cp -f "$src" "release-assets/.collect.tmp"
+            rm -rf "release-assets/$want"     # 可能是同名目录（产物被解成了目录）
+            mv -f "release-assets/.collect.tmp" "release-assets/$want"
+          }
+          collect 'WeKnora-Lite-portable_windows_amd64.zip' '*portable*.zip'
+          collect 'WeKnora-Lite.exe' '*.exe'
+
+          # 收尾：release-assets/ 只留两个规范文件。清掉「套了一层产物名目录」的残留
+          # 与被重命名的副本，否则 find 收集资产时会把它们也当成第 4、第 5 个资产。
+          find release-assets -mindepth 1 -maxdepth 1 \
+            ! -name 'WeKnora-Lite-portable_windows_amd64.zip' \
+            ! -name 'WeKnora-Lite.exe' -print0 |
+            while IFS= read -r -d '' stray; do
+              echo "cleaning stray entry: $stray"
+              rm -rf "$stray"
+            done
+
+          echo "=== release-assets ==="
+          ls -la release-assets/
+
+          if [ ! -f 'release-assets/WeKnora-Lite-portable_windows_amd64.zip' ]; then
+            echo "::error::portable zip missing - nothing to checksum"
             exit 1
           fi
-          echo "checksum target: $ZIP"
-
-          HASH="$(sha256sum "$ZIP" | awk '{print $1}')"
+          HASH="$(sha256sum 'release-assets/WeKnora-Lite-portable_windows_amd64.zip' | awk '{print $1}')"
           # 校验文件里写裸文件名：用户把 zip 和 .sha256 放同一目录后
           # `sha256sum -c` 就能直接用
           printf '%s  %s\n' "$HASH" 'WeKnora-Lite-portable_windows_amd64.zip' \
