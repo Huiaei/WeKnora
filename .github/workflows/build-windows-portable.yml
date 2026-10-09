@@ -324,6 +324,42 @@ jobs:
       - name: Download gojieba module (for jieba-dict extraction)
         run: go mod download github.com/yanyiwu/gojieba
 
+      - name: Smoke-test the merged container (no GUI)
+        # 前面所有步骤只保证「能编出来、能打出来」，保证不了「跑得起来」：上游
+        # 合并一旦破坏运行时（迁移失败、DI 装配失败），构建照样全绿、包照样发出去，
+        # 用户解压双击才发现。cmd/diag 正是为此写的 —— 它装配与桌面版相同的依赖图，
+        # 在路由构造后停下，不碰 wails、不开窗口。这里在 Linux 上真跑一遍。
+        run: |
+          if ! dpkg -s libsqlite3-dev >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq libsqlite3-dev
+          fi
+
+          # gojieba 在 init 期构造，缺词典会 panic，路径必须显式给
+          export JIEBA_DICT_DIR="$(go list -m -f '{{.Dir}}' github.com/yanyiwu/gojieba)/deps/cppjieba/dict"
+          CGO_ENABLED=1 CGO_CFLAGS="-Wno-deprecated-declarations" \
+            go build -tags sqlite_fts5 -o /tmp/weknora-diag ./cmd/diag/
+
+          mkdir -p /tmp/weknora-smoke/files
+          set +e
+          DB_DRIVER=sqlite DB_PATH=/tmp/weknora-smoke/weknora.db \
+          RETRIEVE_DRIVER=sqlite STORAGE_TYPE=local \
+          LOCAL_STORAGE_BASE_DIR=/tmp/weknora-smoke/files \
+          STREAM_MANAGER_TYPE=memory GIN_MODE=release EDITION=lite \
+            timeout 300 /tmp/weknora-diag > /tmp/weknora-smoke/diag.log 2>&1
+          rc=$?
+          set -e
+          tail -20 /tmp/weknora-smoke/diag.log
+
+          [ "$rc" -eq 0 ] || { echo "::error::cmd/diag exited $rc - the container crashes at startup"; exit 1; }
+          grep -q 'ALL GOOD' /tmp/weknora-smoke/diag.log ||
+            { echo "::error::diag did not report 'ALL GOOD'"; exit 1; }
+          grep -q 'Database migrated from version' /tmp/weknora-smoke/diag.log ||
+            { echo "::error::migrations did not run"; exit 1; }
+          test -s /tmp/weknora-smoke/weknora.db ||
+            { echo "::error::sqlite database was not created"; exit 1; }
+          echo "container smoke test passed"
+
       # 合规：仓库把第三方许可当作发布门禁（scripts/check-license-bundle.sh），
       # 上游 release-lite.yml 对每一个产物都调用 copy-licenses.sh，产出
       # LICENSE + THIRD_PARTY_NOTICES.md + licenses/（含 MPL-2.0 的对应源码 zip）。
