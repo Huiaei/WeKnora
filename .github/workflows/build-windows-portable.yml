@@ -389,16 +389,35 @@ jobs:
           need_file README.md
           need_file LICENSE
           need_file THIRD_PARTY_NOTICES.md
-          need_file duckdb-home/extensions/v1.5.2/windows_amd64_mingw/spatial.duckdb_extension
-          need_file duckdb-home/extensions/v1.5.2/windows_amd64_mingw/excel.duckdb_extension
+          # SPA 入口单独断言：只查 web/ 非空的话，前端被套进子目录同样能过，
+          # 而那样 internal/router/static.go 会找不到 index.html
+          need_file web/index.html
+          need_file config/config.yaml
           need_dir web
           need_dir config
-          need_dir migrations
+          need_dir migrations/sqlite          # 应用按 file://migrations/sqlite 跑迁移
           need_dir jieba-dict
           need_dir licenses
+          need_dir licenses/sources
 
           jieba_n=$(find jieba-dict -type f | wc -l)
           [ "$jieba_n" -eq 5 ] || { echo "::error::jieba-dict should hold 5 files, got $jieba_n"; fail=1; }
+
+          # DuckDB 扩展：数量与平台目录都要对 —— MinGW 构建只会去
+          # windows_amd64_mingw 下找，落到 windows_amd64 等于没装
+          ext_files=$(find duckdb-home/extensions -type f -name '*.duckdb_extension')
+          ext_n=$(find duckdb-home/extensions -type f -name '*.duckdb_extension' | wc -l)
+          printf '%s\n' "$ext_files" | sed 's/^/     ext: /'
+          if [ "$ext_n" -lt 2 ]; then
+            echo "::error::expected 2 duckdb extensions, found $ext_n"; fail=1
+          fi
+          printf '%s\n' "$ext_files" | grep -q 'windows_amd64_mingw' ||
+            { echo "::error::duckdb extensions are not under windows_amd64_mingw"; fail=1; }
+
+          # MPL 模块的对应源码 zip 属于许可合规要求，必须在包里
+          src_n=$(find licenses/sources -type f -name '*.zip' | wc -l)
+          [ "$src_n" -ge 1 ] ||
+            { echo "::error::licenses/sources holds no corresponding-source zip"; fail=1; }
 
           # 启动器必须 ASCII + CRLF：带 BOM 第一行会失效，LF 会被 cmd.exe 误读
           ft=$(file -b Start-Portable.bat)
