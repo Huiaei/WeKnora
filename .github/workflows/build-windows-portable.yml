@@ -385,6 +385,14 @@ jobs:
 
           echo "=== assets to publish ==="
           ls -la release-assets/
+          # 用 find 而不是 shell 通配：artifact 解包后无论文件落在 release-assets/
+          # 根下还是某个子目录里都能正确收集，且先列出清单便于排查
+          mapfile -t ASSETS < <(find release-assets -type f | sort)
+          if [ "${#ASSETS[@]}" -eq 0 ]; then
+            echo "::error::no files found under release-assets/ - nothing to publish"
+            exit 1
+          fi
+          printf '  %s\n' "${ASSETS[@]}"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "release '$TAG' exists -> overwriting"
@@ -398,11 +406,11 @@ jobs:
                 esac
               fi
             done < /tmp/assets.txt
-            gh release upload "$TAG" release-assets/* --clobber
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
             gh release edit "$TAG" --title "$TITLE" --notes "$NOTES"
           else
             echo "release '$TAG' does not exist -> creating at $GITHUB_SHA"
-            gh release create "$TAG" --target "$GITHUB_SHA" --title "$TITLE" --notes "$NOTES" release-assets/*
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "$TITLE" --notes "$NOTES" "${ASSETS[@]}"
           fi
 
           echo "=== final release state ==="
