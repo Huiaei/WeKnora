@@ -10,6 +10,12 @@ name: Build Windows Portable
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '发布到哪个 Release 标签（留空 = portable-latest，每次覆盖同一个 Release）'
+        required: false
+        default: ''
+        type: string
   push:
     tags: ['v*.*.*']
 
@@ -24,6 +30,10 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   DUCKDB_VERSION: "v1.5.2"
   WAILS_CLI_VERSION: "v2.12.0"
+  # 滚动发布的固定标签：便携版每次都覆盖到同一个 Release，下载链接保持稳定。
+  # 刻意不用 v* 前缀 —— 否则 gh release create 建出的标签会命中本工作流的
+  # push: tags: ['v*.*.*'] 触发器，自己把自己再跑一轮。
+  PORTABLE_RELEASE_TAG: "portable-latest"
 
 jobs:
   # ── 1. 前端构建（独立 job，产物供桌面构建复用）──
@@ -102,19 +112,6 @@ jobs:
           cd cmd/desktop
           go build -p 1 -buildvcs=false -tags "desktop,sqlite_fts5,production" -o _prebuild_tmp.exe . || true
           rm -f _prebuild_tmp.exe
-
-      - name: Resolve version
-        id: ver
-        shell: bash
-        run: |
-          if [ -n "${{ inputs.tag }}" ]; then
-            VERSION="${{ inputs.tag }}"
-          elif [ -n "${GITHUB_REF#refs/tags/}" ] && [ "${GITHUB_REF#refs/tags/}" != "${GITHUB_REF}" ]; then
-            VERSION="${GITHUB_REF#refs/tags/}"
-          else
-            VERSION="$(git describe --tags --abbrev=0 2>/dev/null || echo dev)"
-          fi
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Build desktop app (wails build)
         shell: bash
@@ -318,58 +315,95 @@ jobs:
             sudo apt-get install -y zip
           fi
 
-          VERSION="${{ inputs.tag }}"
-          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-            # checkout runs with fetch-depth 1 / fetch-tags false, so a tag
-            # push has no local tags to describe. Prefer the ref, and only
-            # fall back to describe for branch runs — this must match the
-            # VERSION the release step derives from GITHUB_REF below.
-            if [ -n "${GITHUB_REF#refs/tags/}" ] && [ "${GITHUB_REF#refs/tags/}" != "${GITHUB_REF}" ]; then
-              VERSION="${GITHUB_REF#refs/tags/}"
-            else
-              VERSION="$(git describe --tags --abbrev=0 2>/dev/null || echo latest)"
-            fi
-          fi
-          echo "archive version: ${VERSION}"
-          ARCHIVE="WeKnora-Lite-portable_windows_amd64_${VERSION}"
+          # 产物名固定、不带版本号：Release 资产名不变，gh release upload
+          # --clobber 才能真正覆盖旧文件，下载链接才能长期稳定。
+          # 版本信息嵌在 exe 的 LDFlags 里（Version / Edition / CommitID /
+          # BuildTime，由 scripts/get_version.sh 从仓库根的 VERSION 文件算出）。
+          ARCHIVE="WeKnora-Lite-portable_windows_amd64"
           cd dist
           zip -r "../${ARCHIVE}.zip" .
           cd ..
           sha256sum "${ARCHIVE}.zip" > "${ARCHIVE}.zip.sha256"
+          ls -la "${ARCHIVE}.zip" "${ARCHIVE}.zip.sha256"
 
       - uses: actions/upload-artifact@v7
         with:
           name: WeKnora-Lite-portable-windows-amd64
           path: |
-            WeKnora-Lite-portable_windows_amd64_*.zip
-            WeKnora-Lite-portable_windows_amd64_*.zip.sha256
+            WeKnora-Lite-portable_windows_amd64.zip
+            WeKnora-Lite-portable_windows_amd64.zip.sha256
           retention-days: 14
 
-      - name: Upload to Release
-        if: startsWith(github.ref, 'refs/tags/')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          VERSION="${GITHUB_REF#refs/tags/}"
-          gh release create "${VERSION}" \
-            --title "WeKnora Lite ${VERSION} (Windows Portable)" \
-            --notes "Windows 便携版：解压后双击 Start-Portable.bat 运行。所有数据写入本目录。" \
-            WeKnora-Lite-portable_windows_amd64_${VERSION}.zip \
-            WeKnora-Lite-portable_windows_amd64_${VERSION}.zip.sha256
-
-  # ── 5. 完整可执行文件（仅 exe，供高级用户）──
-  upload-exe:
-    needs: build-desktop
-    if: startsWith(github.ref, 'refs/tags/')
+  # ── 5. 发布到固定的 Release（每次覆盖，下载链接长期稳定）──
+  # 便携版是滚动产物：标签固定、资产名固定，所以 URL 永远有效。
+  # 已存在就 --clobber 覆盖；不存在就创建（--target 钉到本次构建的 commit，
+  # 否则 gh 会拿默认分支当目标）。
+  publish-release:
+    needs: [build-desktop, package-portable]
     runs-on: ubuntu-latest
     steps:
+      # 只为了读仓库根的 VERSION 文件（写进 Release 说明），不做构建
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: WeKnora-Lite-portable-windows-amd64
+          path: release-assets/
+
       - uses: actions/download-artifact@v8
         with:
           name: desktop-exe
+          path: release-assets/
 
-      - name: Upload exe to Release
+      - name: Publish (create or overwrite)
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
+          DEFAULT_TAG: ${{ env.PORTABLE_RELEASE_TAG }}
         run: |
-          VERSION="${GITHUB_REF#refs/tags/}"
-          gh release upload "${VERSION}" WeKnora-Lite.exe --clobber
+          TAG="${RELEASE_TAG_INPUT:-$DEFAULT_TAG}"
+
+          # 防呆：v*.*.* 形式的标签会命中本工作流的 push 触发器，自己跑自己
+          case "$TAG" in
+            v*.*.*)
+              echo "::error::tag '$TAG' matches the 'v*.*.*' push trigger and would re-trigger this workflow"
+              exit 1
+              ;;
+          esac
+
+          APP_VERSION="$(cat VERSION 2>/dev/null || echo unknown)"
+          TITLE="WeKnora Lite Portable (Windows x64)"
+          NOTES="Windows 便携版（滚动构建，每次覆盖本 Release）
+          - 应用版本: ${APP_VERSION}
+          - commit: ${GITHUB_SHA}
+          - 构建时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          - 触发方式: ${GITHUB_EVENT_NAME}
+
+          解压后双击 Start-Portable.bat 运行；数据、密钥、DuckDB 扩展全部写入该目录，不碰用户目录。"
+
+          echo "=== assets to publish ==="
+          ls -la release-assets/
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release '$TAG' exists -> overwriting"
+            # 清掉不属于本次的文件（例如改名前留下的旧资产），保证 Release 内容干净
+            gh release view "$TAG" --json assets -q '.assets[].name' > /tmp/assets.txt
+            while read -r name; do
+              if [ -n "$name" ]; then
+                case " WeKnora-Lite-portable_windows_amd64.zip WeKnora-Lite-portable_windows_amd64.zip.sha256 WeKnora-Lite.exe " in
+                  *" $name "*) ;;
+                  *) echo "removing stale asset: $name"; gh release delete-asset "$TAG" "$name" --yes || true ;;
+                esac
+              fi
+            done < /tmp/assets.txt
+            gh release upload "$TAG" release-assets/* --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes "$NOTES"
+          else
+            echo "release '$TAG' does not exist -> creating at $GITHUB_SHA"
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "$TITLE" --notes "$NOTES" release-assets/*
+          fi
+
+          echo "=== final release state ==="
+          gh release view "$TAG"
