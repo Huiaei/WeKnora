@@ -19,8 +19,16 @@ on:
   push:
     tags: ['v*.*.*']
 
+# 发布是滚动的：两个 run 同时写同一个 Release 会互相踩（delete-asset 与 upload
+# 交错，可能留下半新半旧的一套资产），所以按固定 group 串行化。不取消进行中的
+# run —— 半途取消可能正好停在「已删旧资产、还没传新资产」的中间态。
+concurrency:
+  group: portable-release
+  cancel-in-progress: false
+
+# 最小权限：只有 publish-release 需要写仓库，其余四个 job 只读即可
 permissions:
-  contents: write
+  contents: read
 
 env:
   # WeKnora go.mod 要求 go 1.26.0；wails CLI 必须与项目依赖的 wails/v2 版本一致
@@ -39,6 +47,7 @@ jobs:
   # ── 1. 前端构建（独立 job，产物供桌面构建复用）──
   build-frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
 
@@ -64,6 +73,8 @@ jobs:
   build-desktop:
     needs: build-frontend
     runs-on: windows-latest
+    # 实测约 20 分钟；给足余量，但别让卡死的 wails build 白烧六小时
+    timeout-minutes: 60
     env:
       CGO_ENABLED: 1
     steps:
@@ -99,7 +110,9 @@ jobs:
         shell: bash
         run: |
           mkdir -p /c/sqlite
-          curl -fsSL -o /c/sqlite/amalgamation.zip "https://www.sqlite.org/2025/sqlite-amalgamation-3500100.zip"
+          # --retry：sqlite.org 偶尔抽风，一次 5xx 不该让整轮构建白跑
+          curl -fsSL --retry 3 --retry-delay 5 --retry-connrefused \
+            -o /c/sqlite/amalgamation.zip "https://www.sqlite.org/2025/sqlite-amalgamation-3500100.zip"
           unzip -o /c/sqlite/amalgamation.zip -d /c/sqlite/
           mv /c/sqlite/sqlite-amalgamation-3500100/* /c/sqlite/ 2>/dev/null || true
           ls /c/sqlite/sqlite3.h /c/sqlite/sqlite3ext.h
@@ -183,6 +196,7 @@ jobs:
   # ── 3. 下载 DuckDB 扩展（独立 job，缓存复用）──
   fetch-extensions:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Download spatial + excel extensions
         run: |
@@ -193,7 +207,9 @@ jobs:
           for EXT in spatial excel; do
             echo "Downloading ${EXT}..."
             # 扩展以 gzip 格式分发（直接 .duckdb_extension URL 返回 404）
-            curl -fSL -o "${EXT}.duckdb_extension.gz" "${BASE}/${EXT}.duckdb_extension.gz"
+            # --retry：extensions.duckdb.org 偶发 5xx，重试比整轮重跑便宜
+            curl -fSL --retry 3 --retry-delay 5 --retry-connrefused \
+              -o "${EXT}.duckdb_extension.gz" "${BASE}/${EXT}.duckdb_extension.gz"
             gunzip -f "${EXT}.duckdb_extension.gz"
           done
 
@@ -225,6 +241,7 @@ jobs:
   package-portable:
     needs: [build-desktop, fetch-extensions]
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
 
@@ -469,6 +486,10 @@ jobs:
   publish-release:
     needs: [build-desktop, package-portable]
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # 唯一需要写权限的 job（gh release create/upload/delete-asset）
+    permissions:
+      contents: write
     steps:
       # 只为了读仓库根的 VERSION 文件（写进 Release 说明），不做构建
       - uses: actions/checkout@v6
@@ -606,6 +627,11 @@ jobs:
             gh release upload "$TAG" "${ASSETS[@]}" --clobber
             gh release edit "$TAG" --title "$TITLE" --notes "$NOTES"
           else
+            # 走到这里有两种可能：Release 确实不存在（正常，走创建），或者 API
+            # 出错（token 权限不足 / 网络）。把 gh 的原文打出来，否则接下来
+            # create 的报错会掩盖真因。
+            echo "gh release view '$TAG' did not succeed; raw error follows:"
+            gh release view "$TAG" 2>&1 | sed 's/^/    /' || true
             echo "release '$TAG' does not exist -> creating at $GITHUB_SHA"
             gh release create "$TAG" --target "$GITHUB_SHA" --title "$TITLE" --notes "$NOTES" "${ASSETS[@]}"
           fi
