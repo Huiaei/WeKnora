@@ -254,6 +254,27 @@ func main() {
 		panic(fmt.Sprintf("wire desktop project dirs: %v", err))
 	}
 
+	// One-shot bootstrap hooks, identical to the server binary: backfill
+	// legacy tenant API key hashes and, while the deployment has no system
+	// admin at all, promote the user named by
+	// WEKNORA_BOOTSTRAP_SYSTEM_ADMIN_EMAIL. Best-effort — it never aborts
+	// startup (see internal/runtime/bootstrap.go).
+	//
+	// The desktop shell has to run this: auto-setup creates the first
+	// account (admin@weknora.local) as a plain user, so without this call
+	// no system administrator can ever exist and the is_system_admin gate
+	// in the UI keeps the whole platform section — system settings, model
+	// catalog, task queue, platform API keys, audit log — unreachable.
+	//
+	// Ordering: on the very first launch the account does not exist yet
+	// (auto-setup runs later, once the webview has loaded), so this call
+	// finds nothing to promote and the promotion is instead performed by
+	// AutoSetup itself, gated on the same env var — see
+	// internal/handler/auth.go. From the second launch on, this hook is the
+	// one that applies it. Leaving the env var set is safe because neither
+	// path grants anything once a system admin exists.
+	runtime.RunStartupBootstrap(c)
+
 	// Initialize the WeKnora App struct
 	app := NewApp()
 	setupBytes := make([]byte, 32)

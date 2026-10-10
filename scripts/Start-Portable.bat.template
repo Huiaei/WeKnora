@@ -78,6 +78,24 @@ set "USERPROFILE=%PORTABLE_ROOT%\userprofile"
 set "APPDATA=%PORTABLE_ROOT%\userprofile\AppData\Roaming"
 set "LOCALAPPDATA=%PORTABLE_ROOT%\userprofile\AppData\Local"
 
+REM --- 3f. System administrator. The desktop build used to run no
+REM        bootstrap at all, so no account could ever be promoted and the
+REM        UI gate on is_system_admin kept the whole platform section
+REM        unreachable (system settings - where the SSRF whitelist lives -
+REM        model catalog, task queue, platform API keys, audit log).
+REM        cmd/desktop now calls the same bootstrap as cmd/server:
+REM        internal/runtime/bootstrap.go promotes the user named by the
+REM        variable below, but only while NO system admin exists yet. The
+REM        first account is created by auto-setup as admin@weknora.local;
+REM        auto-setup performs that first promotion itself (same variable,
+REM        same guard - see internal/handler/auth.go), so the very first
+REM        launch already ends with a system administrator, and from the
+REM        second launch on the startup hook is what applies it. Safe to
+REM        leave set: both paths become a no-op the moment one system
+REM        admin exists, so revoking it in the UI is not silently undone
+REM        on the next start.
+set "WEKNORA_BOOTSTRAP_SYSTEM_ADMIN_EMAIL=admin@weknora.local"
+
 REM --- 4. Run mode ---
 set "GIN_MODE=release"
 
@@ -113,6 +131,7 @@ set "USERSESSION=%REAL_USERPROFILE%\Documents\WeKnoraLite"
 >> "%LOGFILE%" echo  APPDATA                = %APPDATA%
 >> "%LOGFILE%" echo  LOCALAPPDATA           = %LOCALAPPDATA%
 >> "%LOGFILE%" echo  DOCKER_CONFIG          = %DOCKER_CONFIG%
+>> "%LOGFILE%" echo  WEKNORA_BOOTSTRAP_ADMIN = %WEKNORA_BOOTSTRAP_SYSTEM_ADMIN_EMAIL%
 >> "%LOGFILE%" echo  ---- redirected away from the real profile -----
 >> "%LOGFILE%" echo  real profile was       : %REAL_USERPROFILE%
 >> "%LOGFILE%" echo  signing.key UserConfigDir : %USERCFG%\signing.key

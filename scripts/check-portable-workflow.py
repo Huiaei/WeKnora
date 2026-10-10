@@ -266,6 +266,63 @@ def main() -> int:
     if skipped:
         print(f"[check]     （{skipped} 个非 bash run 块已跳过）")
 
+    # ── 10. 便携化的「接线」不能断 ───────────────────────────────────────
+    # 这一组守的是 system-admin 提权的三处接线。它们都是普通文件里的一行，
+    # 构建全绿也照样能被上游合并悄悄改掉 —— 直到用户解压双击，发现
+    # 「设置 → 系统管理」整组页面进不去（真实发生过一次）。
+    repo = WF.resolve().parents[2]
+
+    def read(rel: str) -> str:
+        p = repo / rel
+        return p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
+
+    check(
+        "runtime.RunStartupBootstrap(" in read("cmd/desktop/main.go"),
+        "cmd/desktop/main.go: 调用 runtime.RunStartupBootstrap",
+        "桌面壳不调这个钩子，auto-setup 建出的账号就永远是普通用户，"
+        "而唯一能提权的接口本身就在 system-admin 守卫组里 —— 便携版没有第二条路",
+    )
+    check(
+        "runtime.RunStartupBootstrap(" in read("cmd/server/main.go"),
+        "cmd/server/main.go: 调用 runtime.RunStartupBootstrap",
+        "Docker 部署靠它提权，删掉等于平台管理功能整体失效",
+    )
+
+    launcher = read("scripts/Start-Portable.bat.template")
+    m = re.search(r'^set "WEKNORA_BOOTSTRAP_SYSTEM_ADMIN_EMAIL=([^"]*)"', launcher, re.M)
+    check(
+        bool(m and m.group(1).strip()),
+        "启动器模板: 导出非空的 WEKNORA_BOOTSTRAP_SYSTEM_ADMIN_EMAIL",
+        "没有它，便携版的第一个账号永远不是 system admin",
+    )
+
+    # 启动器点名的账号必须就是 auto-setup 建出来的那个，否则提权打在一个
+    # 不存在的用户上：日志里只有一行 warning，然后什么都不发生。
+    am = re.search(r'const\s+defaultEmail\s*=\s*"([^"]+)"', read("internal/handler/auth.go"))
+    check(
+        bool(m and am and m.group(1).strip() == am.group(1)),
+        "启动器点名的邮箱 == internal/handler/auth.go 里 auto-setup 的 defaultEmail",
+        f"启动器={m.group(1) if m else '?'} auto-setup={am.group(1) if am else '?'}",
+    )
+
+    # smoke test 必须真断言提权成功，且邮箱值从启动器模板里取 ——
+    # 不允许在 YAML 里再写一遍，写两遍早晚漂移。
+    smoke = [
+        s for s in steps_of(jobs["package-portable"])
+        if "weknora-diag" in str(s.get("run", ""))
+    ]
+    smoke_run = str(smoke[0]["run"]) if smoke else ""
+    check(
+        "DIAG_BOOTSTRAP_CHECK=1" in smoke_run,
+        "package-portable/smoke: 用 DIAG_BOOTSTRAP_CHECK=1 真跑一遍提权",
+        "只 build 不 assert 的话，提权坏掉也能全绿发版",
+    )
+    check(
+        "Start-Portable.bat.template" in smoke_run and "BOOTSTRAP OK" in smoke_run,
+        "package-portable/smoke: 邮箱取自启动器模板并断言 BOOTSTRAP OK",
+        "两处各写一遍邮箱值，早晚会漂移",
+    )
+
     print()
     print(f"[check] {checks} 项断言，{len(failures)} 项失败")
     if failures:

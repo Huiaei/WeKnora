@@ -436,6 +436,18 @@ jobs:
           CGO_ENABLED=1 CGO_CFLAGS="-Wno-deprecated-declarations" \
             go build -tags sqlite_fts5 -o /tmp/weknora-diag ./cmd/diag/
 
+          # 便携化的 system-admin 提权：启动器导出的那个变量必须真的能把
+          # auto-setup 建出的账号提升为系统管理员。否则 auto-setup 只注册一个
+          # 普通用户，而唯一能提权的接口本身就在 system-admin 守卫组里 ——
+          # 「设置 → 系统管理」整组页面在便携版里永远进不去（用户实测过）。
+          # 邮箱值直接从启动器模板里取，不在这里再写一遍：单一事实来源，
+          # 模板改了这里跟着改，取不到就当场失败而不是静默跳过。
+          BOOTSTRAP_EMAIL="$(tr -d '\r' < scripts/Start-Portable.bat.template \
+            | sed -n 's/^set "WEKNORA_BOOTSTRAP_SYSTEM_ADMIN_EMAIL=\([^"]*\)"$/\1/p' | head -1)"
+          [ -n "$BOOTSTRAP_EMAIL" ] ||
+            { echo "::error::[package-portable/smoke] 启动器模板没有导出 WEKNORA_BOOTSTRAP_SYSTEM_ADMIN_EMAIL"; exit 1; }
+          echo "bootstrap admin email (取自启动器): ${BOOTSTRAP_EMAIL}"
+
           # 每次都从干净的目录开始：迁移断言依赖「从零迁到最新」这条日志，
           # 复用旧库会让第二次运行误报「migrations did not run」。
           rm -rf /tmp/weknora-smoke
@@ -445,6 +457,7 @@ jobs:
           RETRIEVE_DRIVER=sqlite STORAGE_TYPE=local \
           LOCAL_STORAGE_BASE_DIR=/tmp/weknora-smoke/files \
           STREAM_MANAGER_TYPE=memory GIN_MODE=release EDITION=lite \
+          DIAG_BOOTSTRAP_CHECK=1 WEKNORA_BOOTSTRAP_SYSTEM_ADMIN_EMAIL="$BOOTSTRAP_EMAIL" \
             timeout 300 /tmp/weknora-diag > /tmp/weknora-smoke/diag.log 2>&1
           rc=$?
           set -e
@@ -465,6 +478,12 @@ jobs:
           # 真的走到了 —— 而不是偷偷跑了 standard 配置。
           grep -q 'edition=lite' /tmp/weknora-smoke/diag.log ||
             { echo "::error::[package-portable/smoke] diag did not run in Lite mode"; exit 1; }
+          # DIAG_BOOTSTRAP_CHECK=1 让 diag 真注册账号、真跑提权、再读回来核对，
+          # 并第二次运行证明幂等。这里只认它打出的结论行。
+          grep -q 'BOOTSTRAP OK' /tmp/weknora-smoke/diag.log ||
+            { echo "::error::[package-portable/smoke] system-admin bootstrap did not promote the launcher's account"; exit 1; }
+          grep -q 'promoted user' /tmp/weknora-smoke/diag.log ||
+            { echo "::error::[package-portable/smoke] bootstrap reported OK but logged no promotion"; exit 1; }
           # 前端已在前面下载到 web/；若在，SPA 处理器就必须注册成功
           if [ -f web/index.html ]; then
             grep -q 'Serving frontend static files' /tmp/weknora-smoke/diag.log ||

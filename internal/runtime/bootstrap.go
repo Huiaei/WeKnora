@@ -4,7 +4,16 @@
 // The reasoning is that an operator running with a misconfigured env
 // var should still be able to bring the server up (and fix the issue
 // from the running instance) rather than have a typo brick the deploy.
-package main
+//
+// They live here rather than in cmd/server so that every binary which
+// builds the container runs the same hooks: cmd/server calls
+// RunStartupBootstrap from main(), and cmd/desktop does the same. That
+// matters because the desktop/lite build is a single-user deployment in
+// which the system-admin promotion below is the ONLY way a system
+// administrator can ever come into existence — auto-setup deliberately
+// registers a plain user, so without this call every platform-scoped
+// page stays unreachable forever.
+package runtime
 
 import (
 	"context"
@@ -17,9 +26,13 @@ import (
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
-// bootstrapEnvVar is the env var that names the email of the user who
-// may be promoted to system administrator when the deployment has no
+// BootstrapSystemAdminEnvVar is the env var that names the email of the user
+// who may be promoted to system administrator when the deployment has no
 // existing system administrators.
+//
+// Exported because cmd/diag asserts the promotion end to end, and because
+// scripts/check-portable-workflow.py greps the launcher for the same name;
+// one literal, one place to change it.
 //
 // Why an env var (vs a CLI subcommand)?
 //   - Zero-friction in docker-compose / k8s deploys: set it once in the
@@ -30,13 +43,16 @@ import (
 //   - Safe to leave set: once at least one system admin exists, the env
 //     var stops granting privileges. That prevents a UI revoke from being
 //     silently undone on the next restart.
-const bootstrapEnvVar = "WEKNORA_BOOTSTRAP_SYSTEM_ADMIN_EMAIL"
+const BootstrapSystemAdminEnvVar = "WEKNORA_BOOTSTRAP_SYSTEM_ADMIN_EMAIL"
 
-// runStartupBootstrap consults the env and applies any one-shot
+// RunStartupBootstrap consults the env and applies any one-shot
 // bootstrap actions. Currently it only handles system-admin promotion;
 // future bootstrap steps (default model seeding, etc.) can be added
 // here as additional dig.Invoke calls.
-func runStartupBootstrap(c *dig.Container) {
+//
+// Call it once after container.BuildContainer and before the HTTP
+// listener binds — from cmd/server/main.go and from cmd/desktop/main.go.
+func RunStartupBootstrap(c *dig.Container) {
 	ctx := context.Background()
 
 	// Legacy hash repair for migration 000065 placeholder rows. Invoked each
@@ -52,7 +68,7 @@ func runStartupBootstrap(c *dig.Container) {
 		logger.Warnf(ctx, "[bootstrap] failed to resolve TenantAPIKeyService: %v", err)
 	}
 
-	email := strings.TrimSpace(os.Getenv(bootstrapEnvVar))
+	email := strings.TrimSpace(os.Getenv(BootstrapSystemAdminEnvVar))
 	if email == "" {
 		return
 	}
@@ -60,23 +76,34 @@ func runStartupBootstrap(c *dig.Container) {
 	// service registration is broken we want to know loudly, but still
 	// not abort startup — bootstrap is best-effort.
 	if err := c.Invoke(func(userSvc interfaces.UserService) {
-		bootstrapSystemAdmin(ctx, userSvc, email)
+		PromoteBootstrapSystemAdmin(ctx, userSvc, email)
 	}); err != nil {
 		logger.Warnf(ctx, "[bootstrap] failed to resolve UserService: %v", err)
 	}
 }
 
-// bootstrapSystemAdmin promotes the user identified by `email` to system
-// administrator only when the deployment currently has no system admins.
-// The function is idempotent and non-fatal — it warns and returns on
-// every error path.
+// PromoteBootstrapSystemAdmin promotes the account named by `email` to
+// system administrator, but only while the deployment has no system
+// administrator at all. It reports whether it actually promoted someone.
 //
-// The bootstrap intentionally does NOT create a user when the email is
-// not yet registered: account creation is a workflow with side effects
-// (password hashing, tenant assignment, audit) that we don't want to
-// short-circuit. Operators should sign up normally first, then set the
-// env var on the next restart.
-func bootstrapSystemAdmin(ctx context.Context, userSvc interfaces.UserService, email string) {
+// Two callers need this, at two different moments:
+//
+//   - RunStartupBootstrap, on every start (cmd/server and cmd/desktop).
+//   - AuthHandler.AutoSetup, immediately after it creates the first
+//     lite-edition account. The startup hook has already run by then and
+//     the account did not exist yet, so without this second call the very
+//     first launch of a portable build would leave its only account
+//     without platform access until the next restart.
+//
+// It is idempotent and never fatal: every error path warns and returns
+// false. It intentionally does NOT create the account - registration is a
+// workflow with side effects (password hashing, tenant provisioning,
+// audit) that must not be short-circuited.
+func PromoteBootstrapSystemAdmin(ctx context.Context, userSvc interfaces.UserService, email string) bool {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return false
+	}
 	user, err := userSvc.GetUserByEmail(ctx, email)
 	if err != nil {
 		// "not found" surfaces as an error in this codebase; treat it
@@ -84,42 +111,43 @@ func bootstrapSystemAdmin(ctx context.Context, userSvc interfaces.UserService, e
 		// signed up. The next restart after registration will succeed.
 		logger.Warnf(ctx,
 			"[bootstrap] %s=%s: user lookup failed (have they signed up yet?): %v",
-			bootstrapEnvVar, email, err)
-		return
+			BootstrapSystemAdminEnvVar, email, err)
+		return false
 	}
 	if user == nil {
 		logger.Warnf(ctx,
 			"[bootstrap] %s=%s: no matching user (will retry on next restart)",
-			bootstrapEnvVar, email)
-		return
+			BootstrapSystemAdminEnvVar, email)
+		return false
 	}
 	if user.IsSystemAdmin {
 		logger.Infof(ctx,
 			"[bootstrap] %s=%s: user %s is already a system admin (no-op)",
-			bootstrapEnvVar, email, user.ID)
-		return
+			BootstrapSystemAdminEnvVar, email, user.ID)
+		return false
 	}
 	_, total, err := userSvc.ListSystemAdmins(ctx, 0, 1)
 	if err != nil {
 		logger.Warnf(ctx,
 			"[bootstrap] %s=%s: cannot verify existing system admins, skipping promotion: %v",
-			bootstrapEnvVar, email, err)
-		return
+			BootstrapSystemAdminEnvVar, email, err)
+		return false
 	}
 	if total > 0 {
 		logger.Infof(ctx,
 			"[bootstrap] %s=%s: %d system admin(s) already exist; not promoting user %s",
-			bootstrapEnvVar, email, total, user.ID)
-		return
+			BootstrapSystemAdminEnvVar, email, total, user.ID)
+		return false
 	}
 	user.IsSystemAdmin = true
 	if err := userSvc.UpdateUser(ctx, user); err != nil {
 		logger.Warnf(ctx,
 			"[bootstrap] %s=%s: failed to promote user %s: %v",
-			bootstrapEnvVar, email, user.ID, err)
-		return
+			BootstrapSystemAdminEnvVar, email, user.ID, err)
+		return false
 	}
 	logger.Infof(ctx,
 		"[bootstrap] promoted user %s (%s) to system admin via %s",
-		user.ID, email, bootstrapEnvVar)
+		user.ID, email, BootstrapSystemAdminEnvVar)
+	return true
 }

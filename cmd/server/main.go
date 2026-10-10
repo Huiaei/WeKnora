@@ -59,8 +59,9 @@ func main() {
 	c := container.BuildContainer(runtime.GetContainer())
 
 	// One-shot bootstrap hooks (e.g. promote env-named user to system
-	// admin). Best-effort: never aborts startup — see bootstrap.go.
-	runStartupBootstrap(c)
+	// admin). Best-effort: never aborts startup — see
+	// internal/runtime/bootstrap.go. Shared with cmd/desktop.
+	runtime.RunStartupBootstrap(c)
 
 	// Run application
 	err := c.Invoke(func(

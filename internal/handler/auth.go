@@ -9,6 +9,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -18,6 +19,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/handler/dto"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/runtime"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
@@ -942,6 +944,24 @@ func (h *AuthHandler) AutoSetup(c *gin.Context) {
 			appErr := errors.NewInternalServerError("auto-setup failed: user not found after registration")
 			c.Error(appErr)
 			return
+		}
+	}
+
+	// First launch of a portable/lite deployment: the shell's startup bootstrap
+	// (cmd/desktop -> runtime.RunStartupBootstrap) has already run, but this
+	// account did not exist yet back then, so there was nothing to promote.
+	// Registration only ever creates plain users, and POST /system/admin/promote
+	// itself sits behind the system-admin guard, so without this second attempt
+	// the only account in the deployment could never reach the platform pages
+	// (system settings - where the SSRF whitelist lives - model catalog, task
+	// queue, platform API keys, audit log). Gated on the same env var as the
+	// startup hook, and a no-op once any system admin exists, so leaving the var
+	// set stays safe.
+	if strings.TrimSpace(os.Getenv(runtime.BootstrapSystemAdminEnvVar)) == defaultEmail {
+		if runtime.PromoteBootstrapSystemAdmin(ctx, h.userService, defaultEmail) {
+			if promoted, err := h.userService.GetUserByEmail(ctx, defaultEmail); err == nil && promoted != nil {
+				user = promoted
+			}
 		}
 	}
 
