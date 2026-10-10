@@ -68,6 +68,10 @@ jobs:
           name: frontend-dist
           path: frontend/dist/
           retention-days: 1
+          # 当前 frontend/dist/ 里没有 dotfile，但 Vite 会原样拷贝 public/，
+          # 而 public/ 出现 .nojekyll / .well-known 之类只是时间问题 —— 静默
+          # 丢文件正是上一轮踩过的坑，这里一并打开。
+          include-hidden-files: true
 
   # ── 2. Windows 桌面应用构建 ──
   build-desktop:
@@ -520,6 +524,12 @@ jobs:
           name: portable-dist
           path: dist/
           retention-days: 14
+          # 必须显式打开：upload-artifact 的 include-hidden-files 默认是 false，
+          # 会**静默丢弃** dist/ 里的 dotfile —— 也就是 .env 和 .env.lite.example。
+          # 两者都是便携包的一部分（启动器与 cmd/desktop/main.go:216 的
+          # godotenv.Load() 都依赖 .env），而产物上传是「成功」的，只有
+          # publish-release 的断言能发现。这个默认值已害我们白跑一轮。
+          include-hidden-files: true
 
   # ── 5. 发布到固定的 Release（每次覆盖，下载链接长期稳定）──
   # 便携版是滚动产物：标签固定、资产名固定，所以 URL 永远有效。
@@ -565,11 +575,18 @@ jobs:
           echo "=== release-assets (top level) ==="
           ls -la release-assets/ | head -40
 
-          # 先确认下载下来的确实是完整的便携包，再花时间去 zip 138MB
+          # 先确认下载下来的确实是完整的便携包，再花时间去 zip 138MB。
+          # 缺的若是点开头的文件，八成是上传/下载对 dotfile 的坑：upload-artifact
+          # 的 include-hidden-files 默认为 false，会静默丢弃 .env，产物本身却是
+          # 「上传成功」。把这条线索直接写进报错里，省得下次再隔空猜一轮。
           for rel in WeKnora-Lite.exe web/index.html config/config.yaml \
                      migrations/sqlite/000000_init.up.sql Start-Portable.bat .env; do
             if [ ! -e "release-assets/$rel" ]; then
-              echo "::error::release-assets/$rel is missing - the portable-dist artifact is incomplete"
+              hint=""
+              case "$(basename "$rel")" in
+                .*) hint=" (hidden file - check include-hidden-files: true on the upload step)" ;;
+              esac
+              echo "::error::release-assets/$rel is missing - the portable-dist artifact is incomplete${hint}"
               find release-assets -maxdepth 2 -printf '%y %10s  %p\n' | sort -k3 | head -40
               exit 1
             fi
