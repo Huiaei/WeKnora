@@ -44,8 +44,34 @@ env:
   PORTABLE_RELEASE_TAG: "portable-latest"
 
 jobs:
+  # ── 0. 静态不变量检查（几秒钟，挡在整条流水线前面）──
+  # 前两次真实失败都不是「代码写错」，而是工作流自身的约定被违反：上传端产出的
+  # 名字与下载端要的对不上、上传时没开 include-hidden-files 而下游断言 .env 存在。
+  # 这类问题读一遍 YAML 就能发现，不该花十几分钟构建才暴露。
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Dump environment
+        run: bash scripts/ci-diag.sh env
+
+      - name: Static invariant checks
+        run: |
+          # 检查器只用 PyYAML；runner 上通常自带，缺了就装（几秒，换来确定的解析）
+          python3 -c 'import yaml' 2>/dev/null ||
+            python3 -m pip install --quiet --disable-pip-version-check pyyaml
+          python3 scripts/check-portable-workflow.py
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          [ -f scripts/ci-diag.sh ] && bash scripts/ci-diag.sh failure || true
+
   # ── 1. 前端构建（独立 job，产物供桌面构建复用）──
   build-frontend:
+    needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -63,6 +89,11 @@ jobs:
           npm ci
           npm run build
 
+      # 上传前把「这一步到底会送出什么」写进日志：出问题时能立刻分辨是
+      # 「没生成」还是「传丢了」，而不是从下游的报错反推。
+      - name: Dump frontend output
+        run: bash scripts/ci-diag.sh upload frontend/dist frontend-dist true
+
       - uses: actions/upload-artifact@v7
         with:
           name: frontend-dist
@@ -73,9 +104,17 @@ jobs:
           # 丢文件正是上一轮踩过的坑，这里一并打开。
           include-hidden-files: true
 
+      # 失败时最贵的成本是「不知道磁盘上当时是什么」。任何一步失败都把现场摊开，
+      # 日志里 grep '[DIAG]' 就能拿到全部诊断点，不必再隔空猜。
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          # checkout 本身失败时脚本还不存在，别让诊断步骤再抛一个无关错误
+          [ -f scripts/ci-diag.sh ] && bash scripts/ci-diag.sh failure || true
+
   # ── 2. Windows 桌面应用构建 ──
   build-desktop:
-    needs: build-frontend
+    needs: [preflight, build-frontend]
     runs-on: windows-latest
     # 实测约 20 分钟；给足余量，但别让卡死的 wails build 白烧六小时
     timeout-minutes: 60
@@ -181,13 +220,21 @@ jobs:
                    \( -name 'WeKnora-Lite.exe' -o -name 'WeKnora-Lite' -o -name '*.exe' \) \
                    ! -name '*installer*' | head -1)"
           if [ -z "$EXE" ]; then
-            echo "::error::No exe found in cmd/desktop/build/bin"
+            echo "::error::[build-desktop/locate-exe] No exe found in cmd/desktop/build/bin"
             ls -la cmd/desktop/build/bin || true
             exit 1
           fi
           echo "found: $EXE"
           cp "$EXE" WeKnora-Lite.exe
           ls -la WeKnora-Lite.exe
+
+      # 构建产物现场：wails 的 -o 不补 .exe、bindings 崩溃都发生在这里，
+      # 把 build/bin 的实际内容打出来，下次不用再猜「到底编出了什么」。
+      - name: Dump build output
+        shell: bash
+        run: |
+          bash scripts/ci-diag.sh tree cmd/desktop/build/bin 1
+          bash scripts/ci-diag.sh dotfiles cmd/desktop/build/bin true
 
       - uses: actions/upload-artifact@v7
         with:
@@ -197,13 +244,32 @@ jobs:
           # artifact ... WeKnora-Lite.exe" 可证）。两处字符串必须一致。
           path: WeKnora-Lite.exe
           archive: false
+          # 与其它上传保持一致：默认 false 会静默丢掉点文件。这里当前没有点文件，
+          # 但「上传成功 ≠ 内容完整」这个坑已经踩过两次，代价为零就一并打开。
+          include-hidden-files: true
           retention-days: 1
+
+      # 失败时最贵的成本是「不知道磁盘上当时是什么」。任何一步失败都把现场摊开，
+      # 日志里 grep '[DIAG]' 就能拿到全部诊断点，不必再隔空猜。
+      - name: Dump diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          # checkout 本身失败时脚本还不存在，别让诊断步骤再抛一个无关错误
+          [ -f scripts/ci-diag.sh ] && bash scripts/ci-diag.sh failure || true
 
   # ── 3. 下载 DuckDB 扩展（独立 job，缓存复用）──
   fetch-extensions:
+    needs: preflight
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      # 这个 job 本身不编译任何东西，但失败转储要用仓库里的 scripts/ci-diag.sh
+      - uses: actions/checkout@v6
+
+      - name: Dump environment
+        run: bash scripts/ci-diag.sh env
+
       - name: Download spatial + excel extensions
         run: |
           mkdir -p duckdb-home/extensions/${{ env.DUCKDB_VERSION }}/windows_amd64_mingw
@@ -234,6 +300,13 @@ jobs:
           tar czf duckdb-extensions.tar.gz duckdb-home
           tar tzf duckdb-extensions.tar.gz
 
+      # 打包内容现场：这里必须保住 extensions/<ver>/windows_amd64_mingw/ 层级
+      # （upload-artifact 会把目录根到公共祖先压平），tar 清单就是证据。
+      - name: Dump extension payload
+        run: |
+          bash scripts/ci-diag.sh tree duckdb-home 4
+          bash scripts/ci-diag.sh tree . 1
+
       - uses: actions/upload-artifact@v7
         with:
           # archive: false -> 直接上传 tar.gz 本身（单文件），不再被套一层 zip；
@@ -241,7 +314,16 @@ jobs:
           # 产物名取文件名，下载端的 name 正是 duckdb-extensions.tar.gz。
           path: duckdb-extensions.tar.gz
           archive: false
+          include-hidden-files: true
           retention-days: 1
+
+      # 失败时最贵的成本是「不知道磁盘上当时是什么」。任何一步失败都把现场摊开，
+      # 日志里 grep '[DIAG]' 就能拿到全部诊断点，不必再隔空猜。
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          # checkout 本身失败时脚本还不存在，别让诊断步骤再抛一个无关错误
+          [ -f scripts/ci-diag.sh ] && bash scripts/ci-diag.sh failure || true
 
   # ── 4. 便携打包（合并 exe + 前端 + 扩展 + 启动器）──
   package-portable:
@@ -280,6 +362,14 @@ jobs:
           path: exts/
           merge-multiple: true
 
+      # 下载完立刻记录「实际落成什么样」：download-artifact 的落点已经坑过两次
+      # （嗅探到 .zip 就解包、或再套一层同名目录），这里绝不靠假设。
+      - name: Dump downloaded artifacts
+        run: |
+          bash scripts/ci-diag.sh download dist "WeKnora-Lite.exe"
+          bash scripts/ci-diag.sh download exts "duckdb-extensions.tar.gz"
+          bash scripts/ci-diag.sh download web "frontend-dist"
+
       - name: Normalize downloaded artifacts
         run: |
           # 不假设 download-artifact 的落点：把 exe 与 tar.gz 都定位出来并归位到
@@ -298,7 +388,7 @@ jobs:
             [ -n "$src" ] || src="$(find . -path ./.git -prune -o -type f -name 'WeKnora-Lite.exe' -print | head -1)"
             [ -n "$src" ] || src="$(find . -path ./.git -prune -o -type f -name '*.exe' -print | head -1)"
             if [ -z "$src" ]; then
-              echo "::error::desktop exe not found under dist/ nor anywhere in the workspace"
+              echo "::error::[package-portable/normalize] desktop exe not found under dist/ nor anywhere in the workspace"
               exit 1
             fi
             echo "relocating $src -> dist/WeKnora-Lite.exe"
@@ -313,7 +403,7 @@ jobs:
             [ -n "$src" ] || src="$(find . -path ./.git -prune -o -type f -name 'duckdb-extensions.tar.gz' -print | head -1)"
             [ -n "$src" ] || src="$(find . -path ./.git -prune -o -type f -name '*.tar.gz' -print | head -1)"
             if [ -z "$src" ]; then
-              echo "::error::duckdb extensions archive not found under exts/ nor anywhere in the workspace"
+              echo "::error::[package-portable/normalize] duckdb extensions archive not found under exts/ nor anywhere in the workspace"
               exit 1
             fi
             echo "relocating $src -> exts/duckdb-extensions.tar.gz"
@@ -363,22 +453,22 @@ jobs:
           echo "--- diag log tail ---"
           tail -20 /tmp/weknora-smoke/diag.log
 
-          [ "$rc" -eq 0 ] || { echo "::error::cmd/diag exited $rc - the container crashes at startup"; exit 1; }
+          [ "$rc" -eq 0 ] || { echo "::error::[package-portable/smoke] cmd/diag exited $rc - the container crashes at startup"; exit 1; }
           grep -q 'ALL GOOD' /tmp/weknora-smoke/diag.log ||
-            { echo "::error::diag did not report 'ALL GOOD'"; exit 1; }
+            { echo "::error::[package-portable/smoke] diag did not report 'ALL GOOD'"; exit 1; }
           grep -q 'Database migrated from version' /tmp/weknora-smoke/diag.log ||
-            { echo "::error::migrations did not run"; exit 1; }
+            { echo "::error::[package-portable/smoke] migrations did not run"; exit 1; }
           test -s /tmp/weknora-smoke/weknora.db ||
-            { echo "::error::sqlite database was not created"; exit 1; }
+            { echo "::error::[package-portable/smoke] sqlite database was not created"; exit 1; }
           # cmd/diag 现在与 cmd/desktop 一样把进程标记为 Lite；router.go 只在
           # Edition == "lite" 时才注册 SPA 处理器，所以这一行同时证明了 Lite 分支
           # 真的走到了 —— 而不是偷偷跑了 standard 配置。
           grep -q 'edition=lite' /tmp/weknora-smoke/diag.log ||
-            { echo "::error::diag did not run in Lite mode"; exit 1; }
+            { echo "::error::[package-portable/smoke] diag did not run in Lite mode"; exit 1; }
           # 前端已在前面下载到 web/；若在，SPA 处理器就必须注册成功
           if [ -f web/index.html ]; then
             grep -q 'Serving frontend static files' /tmp/weknora-smoke/diag.log ||
-              { echo "::error::web/index.html exists but the Lite SPA handler did not register"; exit 1; }
+              { echo "::error::[package-portable/smoke] web/index.html exists but the Lite SPA handler did not register"; exit 1; }
           else
             echo "::warning::web/index.html absent - skipping the SPA handler assertion"
           fi
@@ -412,12 +502,12 @@ jobs:
           # 是包级 var（init 期就构造），所以这里必须硬校验：否则打包会"成功"，
           # 用户一启动就崩。5 个文件一个都不能少。
           if [ ! -d "$GOJIEBA" ]; then
-            echo "::error::gojieba module cache not found at $GOJIEBA"
+            echo "::error::[package-portable/assemble] gojieba module cache not found at $GOJIEBA"
             exit 1
           fi
           mkdir -p jieba-dict
           for f in jieba.dict.utf8 hmm_model.utf8 idf.utf8 stop_words.utf8 user.dict.utf8; do
-            cp "$GOJIEBA/dict/$f" jieba-dict/ || { echo "::error::missing jieba dict file: $f"; exit 1; }
+            cp "$GOJIEBA/dict/$f" jieba-dict/ || { echo "::error::[package-portable/assemble] missing jieba dict file: $f"; exit 1; }
           done
           echo "jieba-dict: $(ls jieba-dict | wc -l) files (gojieba ${GOJIEBA_VERSION})"
 
@@ -449,24 +539,24 @@ jobs:
           fail=0
           need_file() {
             local p="$1" min="${2:-0}" sz=0
-            if [ ! -f "$p" ]; then echo "::error::missing file: dist/$p"; fail=1; return; fi
+            if [ ! -f "$p" ]; then echo "::error::[package-portable/verify] missing file: dist/$p"; fail=1; return; fi
             sz=$(stat -c%s "$p")
             if [ "$sz" -lt "$min" ]; then
-              echo "::error::dist/$p is only $sz bytes (expected >= $min)"; fail=1; return
+              echo "::error::[package-portable/verify] dist/$p is only $sz bytes (expected >= $min)"; fail=1; return
             fi
             echo "ok   file  $p  ($sz B)"
           }
           need_dir() {
             local p="$1" n=0
-            if [ ! -d "$p" ]; then echo "::error::missing dir: dist/$p"; fail=1; return; fi
+            if [ ! -d "$p" ]; then echo "::error::[package-portable/verify] missing dir: dist/$p"; fail=1; return; fi
             n=$(find "$p" -type f | wc -l)
-            if [ "$n" -eq 0 ]; then echo "::error::empty dir: dist/$p"; fail=1; return; fi
+            if [ "$n" -eq 0 ]; then echo "::error::[package-portable/verify] empty dir: dist/$p"; fail=1; return; fi
             echo "ok   dir   $p  ($n files)"
           }
 
           # exe 必须是文件而不是同名目录：archive: false 的产物若被解成目录就会这样
           if [ -d WeKnora-Lite.exe ]; then
-            echo "::error::dist/WeKnora-Lite.exe is a DIRECTORY - download-artifact nested it"
+            echo "::error::[package-portable/verify] dist/WeKnora-Lite.exe is a DIRECTORY - download-artifact nested it"
             fail=1
           fi
           need_file WeKnora-Lite.exe 50000000
@@ -487,7 +577,7 @@ jobs:
           need_dir licenses/sources
 
           jieba_n=$(find jieba-dict -type f | wc -l)
-          [ "$jieba_n" -eq 5 ] || { echo "::error::jieba-dict should hold 5 files, got $jieba_n"; fail=1; }
+          [ "$jieba_n" -eq 5 ] || { echo "::error::[package-portable/verify] jieba-dict should hold 5 files, got $jieba_n"; fail=1; }
 
           # DuckDB 扩展：数量与平台目录都要对 —— MinGW 构建只会去
           # windows_amd64_mingw 下找，落到 windows_amd64 等于没装
@@ -495,21 +585,21 @@ jobs:
           ext_n=$(find duckdb-home/extensions -type f -name '*.duckdb_extension' | wc -l)
           printf '%s\n' "$ext_files" | sed 's/^/     ext: /'
           if [ "$ext_n" -lt 2 ]; then
-            echo "::error::expected 2 duckdb extensions, found $ext_n"; fail=1
+            echo "::error::[package-portable/verify] expected 2 duckdb extensions, found $ext_n"; fail=1
           fi
           printf '%s\n' "$ext_files" | grep -q 'windows_amd64_mingw' ||
-            { echo "::error::duckdb extensions are not under windows_amd64_mingw"; fail=1; }
+            { echo "::error::[package-portable/verify] duckdb extensions are not under windows_amd64_mingw"; fail=1; }
 
           # MPL 模块的对应源码 zip 属于许可合规要求，必须在包里
           src_n=$(find licenses/sources -type f -name '*.zip' | wc -l)
           [ "$src_n" -ge 1 ] ||
-            { echo "::error::licenses/sources holds no corresponding-source zip"; fail=1; }
+            { echo "::error::[package-portable/verify] licenses/sources holds no corresponding-source zip"; fail=1; }
 
           # 启动器必须 ASCII + CRLF：带 BOM 第一行会失效，LF 会被 cmd.exe 误读
           ft=$(file -b Start-Portable.bat)
           echo "Start-Portable.bat: $ft"
-          case "$ft" in *CRLF*) ;; *) echo "::error::Start-Portable.bat lost its CRLF line endings"; fail=1 ;; esac
-          case "$ft" in *ASCII*) ;; *) echo "::error::Start-Portable.bat is not ASCII (BOM or non-ASCII byte)"; fail=1 ;; esac
+          case "$ft" in *CRLF*) ;; *) echo "::error::[package-portable/verify] Start-Portable.bat lost its CRLF line endings"; fail=1 ;; esac
+          case "$ft" in *ASCII*) ;; *) echo "::error::[package-portable/verify] Start-Portable.bat is not ASCII (BOM or non-ASCII byte)"; fail=1 ;; esac
 
           if [ "$fail" -ne 0 ]; then
             echo "=== dist tree (maxdepth 3) ==="
@@ -517,6 +607,15 @@ jobs:
             exit 1
           fi
           echo "portable layout verified"
+
+      # 上传前记录将要送出的完整清单（含 dotfile）：「打包全绿 ≠ 产物完整」，
+      # 上一轮正是 .env 被静默丢掉、到 publish-release 才炸。
+      - name: Dump portable package
+        run: |
+          bash scripts/ci-diag.sh upload dist portable-dist true
+          # 清单同时进 job summary：「构建全绿但产物是错的」是前两轮的失败形态，
+          # 清单摆在页面上，一眼就能看出少了哪个文件，不用翻日志。
+          bash scripts/ci-diag.sh manifest dist "portable package (portable-dist)"
 
       # 不再在这里自建 zip。download-artifact 会把「文件名以 .zip 结尾」的产物
       # 当成压缩包直接解掉 —— 即使上传时用的是 archive: false。于是 publish-release
@@ -533,6 +632,14 @@ jobs:
           # godotenv.Load() 都依赖 .env），而产物上传是「成功」的，只有
           # publish-release 的断言能发现。这个默认值已害我们白跑一轮。
           include-hidden-files: true
+
+      # 失败时最贵的成本是「不知道磁盘上当时是什么」。任何一步失败都把现场摊开，
+      # 日志里 grep '[DIAG]' 就能拿到全部诊断点，不必再隔空猜。
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          # checkout 本身失败时脚本还不存在，别让诊断步骤再抛一个无关错误
+          [ -f scripts/ci-diag.sh ] && bash scripts/ci-diag.sh failure || true
 
   # ── 5. 发布到固定的 Release（每次覆盖，下载链接长期稳定）──
   # 便携版是滚动产物：标签固定、资产名固定，所以 URL 永远有效。
@@ -568,6 +675,13 @@ jobs:
           path: release-assets/
           merge-multiple: true
 
+      # 下载后先把实际落点记下来：这一步的输入正是上一轮失败的地方。
+      - name: Dump downloaded artifacts
+        run: |
+          bash scripts/ci-diag.sh download release-assets "portable-dist + WeKnora-Lite.exe"
+          bash scripts/ci-diag.sh dotfiles release-assets true
+          bash scripts/ci-diag.sh manifest release-assets "release-assets (as downloaded)"
+
       - name: Build release assets (zip + checksum)
         run: |
           if ! command -v zip >/dev/null 2>&1; then
@@ -589,7 +703,7 @@ jobs:
               case "$(basename "$rel")" in
                 .*) hint=" (hidden file - check include-hidden-files: true on the upload step)" ;;
               esac
-              echo "::error::release-assets/$rel is missing - the portable-dist artifact is incomplete${hint}"
+              echo "::error::[publish-release/assets] release-assets/$rel is missing - the portable-dist artifact is incomplete${hint}"
               find release-assets -maxdepth 2 -printf '%y %10s  %p\n' | sort -k3 | head -40
               exit 1
             fi
@@ -621,7 +735,7 @@ jobs:
           # 防呆：v*.*.* 形式的标签会命中本工作流的 push 触发器，自己跑自己
           case "$TAG" in
             v*.*.*)
-              echo "::error::tag '$TAG' matches the 'v*.*.*' push trigger and would re-trigger this workflow"
+              echo "::error::[publish-release/publish] tag '$TAG' matches the 'v*.*.*' push trigger and would re-trigger this workflow"
               exit 1
               ;;
           esac
@@ -647,7 +761,7 @@ jobs:
           )
           for f in "${ASSETS[@]}"; do
             if [ ! -f "$f" ]; then
-              echo "::error::missing release asset: $f"
+              echo "::error::[publish-release/publish] missing release asset: $f"
               ls -la release-assets/ | head -30
               exit 1
             fi
@@ -680,3 +794,11 @@ jobs:
 
           echo "=== final release state ==="
           gh release view "$TAG"
+
+      # 失败时最贵的成本是「不知道磁盘上当时是什么」。任何一步失败都把现场摊开，
+      # 日志里 grep '[DIAG]' 就能拿到全部诊断点，不必再隔空猜。
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          # checkout 本身失败时脚本还不存在，别让诊断步骤再抛一个无关错误
+          [ -f scripts/ci-diag.sh ] && bash scripts/ci-diag.sh failure || true
