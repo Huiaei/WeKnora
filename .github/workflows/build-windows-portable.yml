@@ -511,34 +511,14 @@ jobs:
           fi
           echo "portable layout verified"
 
-      - name: Package archive
-        run: |
-          # ubuntu-latest 预装 zip；显式兜底，避免镜像变动让整轮构建白跑
-          if ! command -v zip >/dev/null 2>&1; then
-            sudo apt-get update -qq
-            sudo apt-get install -y zip
-          fi
-
-          # 产物名固定、不带版本号：Release 资产名不变，gh release upload
-          # --clobber 才能真正覆盖旧文件，下载链接才能长期稳定。
-          # 版本信息嵌在 exe 的 LDFlags 里（Version / Edition / CommitID /
-          # BuildTime，由 scripts/get_version.sh 从仓库根的 VERSION 文件算出）。
-          ARCHIVE="WeKnora-Lite-portable_windows_amd64"
-          cd dist
-          zip -r "../${ARCHIVE}.zip" .
-          cd ..
-          # 这里只打印校验值供日志核对；Release 上的 .sha256 在 publish-release
-          # 里对「实际下载到的字节」重算，保证与 Release 文件严格对应。
-          sha256sum "${ARCHIVE}.zip"
-          ls -la "${ARCHIVE}.zip"
-
+      # 不再在这里自建 zip。download-artifact 会把「文件名以 .zip 结尾」的产物
+      # 当成压缩包直接解掉 —— 即使上传时用的是 archive: false。于是 publish-release
+      # 拿到的是「便携包的内容」而不是一个 zip 文件，两次构建都死在这里。
+      # 改为上传目录本身，zip 统一在 publish-release 里现打（那里才真正需要它）。
       - uses: actions/upload-artifact@v7
         with:
-          # archive: false -> 产物就是那个 zip 本身。否则 upload-artifact 会再压
-          # 一层，从 Actions 页面下载得到「zip 套 zip」，要解两次。name 被忽略，
-          # 产物名 = WeKnora-Lite-portable_windows_amd64.zip。
-          path: WeKnora-Lite-portable_windows_amd64.zip
-          archive: false
+          name: portable-dist
+          path: dist/
           retention-days: 14
 
   # ── 5. 发布到固定的 Release（每次覆盖，下载链接长期稳定）──
@@ -558,13 +538,14 @@ jobs:
         with:
           fetch-depth: 1
 
-      # 两个产物都是 archive: false 上传的单文件，下载后就是原始文件本身。
-      # merge-multiple: true 让它们直接落在 release-assets/ 根下；默认的 false
-      # 会再套一层以产物名命名的目录（release-assets/<artifact>/<file>），
-      # 那样下面按文件名定位就会落空 —— run 37931473095 正是死在这里。
+      # 便携包以「目录」形式上产（name: portable-dist），所以这里拿到的是它的内容。
+      # 关键教训：download-artifact 会把**名字以 .zip 结尾**的产物直接解包，即使
+      # 上传时用的是 archive: false —— 前两次失败都源于此，与落点无关。zip 因此
+      # 在这里现打，因为只有这里真正需要它。
+      # merge-multiple: true 让产物内容直接落在 release-assets/ 根下。
       - uses: actions/download-artifact@v8
         with:
-          name: WeKnora-Lite-portable_windows_amd64.zip
+          name: portable-dist
           path: release-assets/
           merge-multiple: true
 
@@ -574,68 +555,40 @@ jobs:
           path: release-assets/
           merge-multiple: true
 
-      - name: Collect assets + compute checksum
+      - name: Build release assets (zip + checksum)
         run: |
-          # 不猜 download-artifact 把文件放在哪：archive: false 的单文件产物并没有把
-          # path 语义写进文档，merge-multiple 默认 false 又可能套一层以产物名命名的
-          # 目录。run 37931473095 就是死在「假设它落在 release-assets/ 根下」。
-          # 这里先全盘定位两个产物、统一收进 release-assets/，并把真实布局打出来。
-          mkdir -p release-assets
-          # 先把产物区完整打出来（不截断），再看一眼工作区顶层。上一轮正是因为
-          # 清单被 head 截断，真实布局反而没进日志。
-          echo "=== release-assets (recursive) ==="
-          find release-assets -printf '%y %10s  %p\n' | sort -k3
-          echo "=== workspace top level (maxdepth 2, first 25) ==="
-          find . -maxdepth 2 -path ./.git -prune -o -type f -printf '%10s  %p\n' | sort -k2 | head -25
-
-          collect() {   # $1 = 期望文件名, $2 = 兜底通配
-            local want="$1" glob="$2" src=""
-            if [ -f "release-assets/$want" ]; then
-              echo "in place : $want"
-              return 0
-            fi
-            # 先只在产物区里找（避免命中 checkout 里的同名文件），找不到再退到全工作区
-            src="$(find release-assets -type f -name "$want" | head -1)"
-            [ -n "$src" ] || src="$(find release-assets -type f -name "$glob" | head -1)"
-            [ -n "$src" ] || src="$(find . -path ./.git -prune -o -type f -name "$want" -print | head -1)"
-            [ -n "$src" ] || src="$(find . -path ./.git -prune -o -type f -name "$glob" -print | head -1)"
-            if [ -z "$src" ]; then
-              echo "::warning::could not locate $want anywhere in the workspace"
-              return 0
-            fi
-            echo "collected: $src -> release-assets/$want"
-            # 先搬到临时名：src 有可能就在 release-assets/<want>/ 里面，
-            # 直接 rm -rf 那个目录会把源文件一起删掉。
-            cp -f "$src" "release-assets/.collect.tmp"
-            rm -rf "release-assets/$want"     # 可能是同名目录（产物被解成了目录）
-            mv -f "release-assets/.collect.tmp" "release-assets/$want"
-          }
-          collect 'WeKnora-Lite-portable_windows_amd64.zip' '*portable*.zip'
-          collect 'WeKnora-Lite.exe' '*.exe'
-
-          # 收尾：release-assets/ 只留两个规范文件。清掉「套了一层产物名目录」的残留
-          # 与被重命名的副本，否则 find 收集资产时会把它们也当成第 4、第 5 个资产。
-          find release-assets -mindepth 1 -maxdepth 1 \
-            ! -name 'WeKnora-Lite-portable_windows_amd64.zip' \
-            ! -name 'WeKnora-Lite.exe' -print0 |
-            while IFS= read -r -d '' stray; do
-              echo "cleaning stray entry: $stray"
-              rm -rf "$stray"
-            done
-
-          echo "=== release-assets ==="
-          ls -la release-assets/
-
-          if [ ! -f 'release-assets/WeKnora-Lite-portable_windows_amd64.zip' ]; then
-            echo "::error::portable zip missing - nothing to checksum"
-            exit 1
+          if ! command -v zip >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y zip
           fi
-          HASH="$(sha256sum 'release-assets/WeKnora-Lite-portable_windows_amd64.zip' | awk '{print $1}')"
-          # 校验文件里写裸文件名：用户把 zip 和 .sha256 放同一目录后
-          # `sha256sum -c` 就能直接用
-          printf '%s  %s\n' "$HASH" 'WeKnora-Lite-portable_windows_amd64.zip' \
-            > release-assets/WeKnora-Lite-portable_windows_amd64.zip.sha256
-          cat release-assets/WeKnora-Lite-portable_windows_amd64.zip.sha256
+
+          echo "=== release-assets (top level) ==="
+          ls -la release-assets/ | head -40
+
+          # 先确认下载下来的确实是完整的便携包，再花时间去 zip 138MB
+          for rel in WeKnora-Lite.exe web/index.html config/config.yaml \
+                     migrations/sqlite/000000_init.up.sql Start-Portable.bat .env; do
+            if [ ! -e "release-assets/$rel" ]; then
+              echo "::error::release-assets/$rel is missing - the portable-dist artifact is incomplete"
+              find release-assets -maxdepth 2 -printf '%y %10s  %p\n' | sort -k3 | head -40
+              exit 1
+            fi
+          done
+
+          # 产物名固定、不带版本号：Release 资产名不变，gh release upload --clobber
+          # 才能真正覆盖旧文件，下载链接才能长期稳定。
+          ARCHIVE="WeKnora-Lite-portable_windows_amd64"
+          # zip 建在工作区根，避免把自己也打进去；. 保证隐藏文件（.env）也被收进去
+          ( cd release-assets && zip -r "../${ARCHIVE}.zip" . )
+          ls -la "${ARCHIVE}.zip"
+
+          # 校验文件里写裸文件名：用户把 zip 与 .sha256 放同一目录后 sha256sum -c 可直接用
+          HASH="$(sha256sum "${ARCHIVE}.zip" | awk '{print $1}')"
+          printf '%s  %s\n' "$HASH" "${ARCHIVE}.zip" > "release-assets/${ARCHIVE}.zip.sha256"
+          mv -f "${ARCHIVE}.zip" release-assets/
+
+          echo "=== assets ready ==="
+          ls -la release-assets/*.zip release-assets/*.sha256 release-assets/WeKnora-Lite.exe
 
       - name: Publish (create or overwrite)
         env:
@@ -664,15 +617,22 @@ jobs:
           解压后双击 Start-Portable.bat 运行；数据、密钥、DuckDB 扩展全部写入该目录，不碰用户目录。"
 
           echo "=== assets to publish ==="
-          ls -la release-assets/
-          # 用 find 而不是 shell 通配：artifact 解包后无论文件落在 release-assets/
-          # 根下还是某个子目录里都能正确收集，且先列出清单便于排查
-          mapfile -t ASSETS < <(find release-assets -type f | sort)
-          if [ "${#ASSETS[@]}" -eq 0 ]; then
-            echo "::error::no files found under release-assets/ - nothing to publish"
-            exit 1
-          fi
-          printf '  %s\n' "${ASSETS[@]}"
+          # 显式列出三个资产。这里绝不能用 `find release-assets -type f` ——
+          # release-assets/ 现在装着整个便携包的内容（config/ migrations/ web/ …），
+          # 那样会把几百个文件都当成 Release 资产。
+          ASSETS=(
+            release-assets/WeKnora-Lite-portable_windows_amd64.zip
+            release-assets/WeKnora-Lite-portable_windows_amd64.zip.sha256
+            release-assets/WeKnora-Lite.exe
+          )
+          for f in "${ASSETS[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::missing release asset: $f"
+              ls -la release-assets/ | head -30
+              exit 1
+            fi
+            ls -la "$f"
+          done
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "release '$TAG' exists -> overwriting"
