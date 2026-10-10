@@ -192,7 +192,9 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           # archive: false -> 直接把 exe 当产物上传，不再被套一层 zip（从 Actions
-          # 页面下载即得原始 exe）。此时 name 参数被忽略，产物名 = 文件名。
+          # 页面下载即得原始 exe）。实测：不写 name 时产物名取文件名，因此下载端
+          # 用的 name 正是 WeKnora-Lite.exe（run 日志里 "Downloading single
+          # artifact ... WeKnora-Lite.exe" 可证）。两处字符串必须一致。
           path: WeKnora-Lite.exe
           archive: false
           retention-days: 1
@@ -235,8 +237,8 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           # archive: false -> 直接上传 tar.gz 本身（单文件），不再被套一层 zip；
-          # 下载方拿到的是原始 tar.gz，解包后目录结构不变。name 被忽略，
-          # 产物名 = duckdb-extensions.tar.gz。
+          # 下载方拿到的是原始 tar.gz，解包后目录结构不变。同样地，不写 name 时
+          # 产物名取文件名，下载端的 name 正是 duckdb-extensions.tar.gz。
           path: duckdb-extensions.tar.gz
           archive: false
           retention-days: 1
@@ -399,7 +401,8 @@ jobs:
           cp -r ../web .
           cp -r ../config .
           cp -r ../migrations .
-          if [ -f ../.env ]; then cp ../.env .; fi
+          # 这里刻意不从仓库根复制 .env：便携包永远以 .env.lite.example 为准
+          # （仓库根本来也没有 .env，见下面的说明）。
 
           # jieba 词典：仓库不含，从 gojieba 模块缓存提取
           # gojieba 把模块缓存路径编译进二进制，跨平台构建必须用 JIEBA_DICT_DIR 重定向
