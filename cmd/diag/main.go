@@ -11,8 +11,9 @@
 // account as a plain user, the is_system_admin gate then hides the whole
 // platform section, and nothing in the build log looks wrong. Setting
 // DIAG_BOOTSTRAP_CHECK=1 makes the probe run that sequence against a real
-// database and a real router - startup hook, then POST /auth/auto-setup - and
-// fail unless the account comes back as a system administrator.
+// database and a real router and fail unless the account ends up as a system
+// administrator - both on a brand new deployment and on an existing package
+// whose account predates the change.
 package main
 
 import (
@@ -40,9 +41,42 @@ import (
 // value, so any non-empty constant works.
 const diagSetupToken = "diag-desktop-setup-token"
 
+// autoSetupUser mirrors the part of the response the frontend actually stores
+// as the session. is_system_admin here is literally what the UI gate reads, so
+// asserting on it is asserting on what the user sees.
+type autoSetupUser struct {
+	Email         string `json:"email"`
+	IsSystemAdmin bool   `json:"is_system_admin"`
+}
+
+type autoSetupResponse struct {
+	Success bool           `json:"success"`
+	User    *autoSetupUser `json:"user"`
+}
+
 func step(format string, a ...any) {
 	fmt.Printf("### %s\n", fmt.Sprintf(format, a...))
 	os.Stdout.Sync()
+}
+
+// postAutoSetup drives the real first-launch request path through the real
+// router, so it covers the routing, the desktop-token check and the handler.
+func postAutoSetup(engine *gin.Engine) (*autoSetupResponse, error) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/auto-setup", nil)
+	req.Header.Set("X-WeKnora-Desktop-Token", diagSetupToken)
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		return nil, fmt.Errorf("status %d: %s", rec.Code, strings.TrimSpace(rec.Body.String()))
+	}
+	var resp autoSetupResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		return nil, fmt.Errorf("decode the response: %w", err)
+	}
+	if resp.User == nil {
+		return nil, fmt.Errorf("the response carries no user: %s", strings.TrimSpace(rec.Body.String()))
+	}
+	return &resp, nil
 }
 
 func main() {
@@ -70,7 +104,7 @@ func main() {
 			step("BOOTSTRAP CHECK FAILED: %v", err)
 			os.Exit(1)
 		}
-		step("BOOTSTRAP OK - first launch ends with exactly one system admin")
+		step("BOOTSTRAP OK - first launch and upgrade both end with exactly one system admin")
 	}
 
 	done := make(chan error, 1)
@@ -95,8 +129,9 @@ func main() {
 	step("ALL GOOD - no crash in DI graph")
 }
 
-// checkSystemAdminBootstrap replays, in order, exactly what the portable
-// package does on its first launch - on a database that has never been used:
+// checkSystemAdminBootstrap replays, in order, what the portable package does
+// on a database that has never been used, and then what it does on a database
+// left behind by an older build:
 //
 //  1. the shell runs the startup hook before the window opens (nothing exists
 //     yet, so nothing may be created and nothing may fail);
@@ -105,7 +140,11 @@ func main() {
 //     administrator, otherwise the platform section stays hidden until the
 //     next restart;
 //  3. the hook runs again on the next start and must be a no-op, leaving
-//     exactly one system administrator behind.
+//     exactly one system administrator behind;
+//  4. an existing package (account present, but plain - the state the reporter
+//     of the missing platform section is in) must be repaired by the hook on
+//     the first launch of the new build, and the auto-setup response must then
+//     report the promoted state.
 func checkSystemAdminBootstrap(c *dig.Container) error {
 	ctx := context.Background()
 	envVar := runtime.BootstrapSystemAdminEnvVar
@@ -135,38 +174,21 @@ func checkSystemAdminBootstrap(c *dig.Container) error {
 	if engine == nil {
 		return fmt.Errorf("router is nil")
 	}
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/auto-setup", nil)
-	req.Header.Set("X-WeKnora-Desktop-Token", diagSetupToken)
-	engine.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		return fmt.Errorf("POST /api/v1/auth/auto-setup: status %d: %s",
-			rec.Code, strings.TrimSpace(rec.Body.String()))
-	}
-	var resp struct {
-		Success bool `json:"success"`
-		User    *struct {
-			Email         string `json:"email"`
-			IsSystemAdmin bool   `json:"is_system_admin"`
-		} `json:"user"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		return fmt.Errorf("decode the auto-setup response: %w", err)
-	}
-	if resp.User == nil {
-		return fmt.Errorf("the auto-setup response carries no user: %s", strings.TrimSpace(rec.Body.String()))
+	resp, err := postAutoSetup(engine)
+	if err != nil {
+		return fmt.Errorf("first launch: POST /api/v1/auth/auto-setup: %w", err)
 	}
 	if !resp.User.IsSystemAdmin {
 		return fmt.Errorf(
-			"auto-setup returned is_system_admin=false for %s: the only account in the "+
-				"deployment cannot reach the platform section", resp.User.Email)
+			"first launch: auto-setup returned is_system_admin=false for %s: the only account "+
+				"in the deployment cannot reach the platform section", resp.User.Email)
 	}
-	step("BOOTSTRAP: auto-setup returned %s as a system admin", resp.User.Email)
+	step("BOOTSTRAP: first launch - auto-setup returned %s as a system admin", resp.User.Email)
 
 	// 3. Next start: the hook must be a no-op and the deployment must be left
 	//    with exactly one system administrator.
 	runtime.RunStartupBootstrap(c)
-	return c.Invoke(func(userSvc interfaces.UserService) error {
+	if err := c.Invoke(func(userSvc interfaces.UserService) error {
 		_, total, err := userSvc.ListSystemAdmins(ctx, 0, 10)
 		if err != nil {
 			return fmt.Errorf("list system admins: %w", err)
@@ -179,7 +201,54 @@ func checkSystemAdminBootstrap(c *dig.Container) error {
 			return fmt.Errorf("user %s is not a system admin after the whole sequence", email)
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+
+	// 4. Upgrade path: an older package already has the account, but as a
+	//    plain user. Nothing in the frontend can fix that (registration only
+	//    creates plain users, and promote itself needs an admin), so the
+	//    startup hook has to.
+	if err := c.Invoke(func(userSvc interfaces.UserService) error {
+		u, err := userSvc.GetUserByEmail(ctx, email)
+		if err != nil || u == nil {
+			return fmt.Errorf("reload %s: %v", email, err)
+		}
+		u.IsSystemAdmin = false
+		if err := userSvc.UpdateUser(ctx, u); err != nil {
+			return fmt.Errorf("demote %s back to a plain user: %w", email, err)
+		}
+		// Confirm the demotion really landed, otherwise this step would be
+		// asserting against a state we never created.
+		back, err := userSvc.GetUserByEmail(ctx, email)
+		if err != nil || back == nil || back.IsSystemAdmin {
+			return fmt.Errorf("could not demote %s to reproduce an existing package", email)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	runtime.RunStartupBootstrap(c)
+	if err := c.Invoke(func(userSvc interfaces.UserService) error {
+		u, err := userSvc.GetUserByEmail(ctx, email)
+		if err != nil || u == nil || !u.IsSystemAdmin {
+			return fmt.Errorf(
+				"upgrade path: the startup hook did not promote the pre-existing plain user %s", email)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	upgraded, err := postAutoSetup(engine)
+	if err != nil {
+		return fmt.Errorf("upgrade path: POST /api/v1/auth/auto-setup: %w", err)
+	}
+	if !upgraded.User.IsSystemAdmin {
+		return fmt.Errorf("upgrade path: auto-setup reported is_system_admin=false for the promoted %s", email)
+	}
+	step("BOOTSTRAP: upgrade path - an existing plain user is promoted by the startup hook")
+
+	return nil
 }
 
 func countRoutes(r *gin.Engine) int {

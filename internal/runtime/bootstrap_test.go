@@ -198,3 +198,36 @@ func TestRunStartupBootstrapSurvivesBackfillAndUpdateErrors(t *testing.T) {
 		t.Fatalf("updated = %v, want none after a write error", users.updated)
 	}
 }
+
+// TestPromoteBootstrapSystemAdminReportsWhetherItPromoted pins the return-value
+// contract. internal/handler/auth.go uses it to decide whether the account it
+// has just registered must be re-read before being handed to the frontend: a
+// false negative there would give the webview a user object with
+// is_system_admin=false and keep the whole platform section hidden even though
+// the promotion did happen.
+func TestPromoteBootstrapSystemAdminReportsWhetherItPromoted(t *testing.T) {
+	ctx := context.Background()
+	const email = "admin@weknora.local"
+
+	cases := []struct {
+		name string
+		svc  *stubUserService
+		mail string
+		want bool
+	}{
+		{"plain user, no admin yet", &stubUserService{user: &types.User{ID: "u1", Email: email}}, email, true},
+		{"already a system admin", &stubUserService{user: &types.User{ID: "u1", Email: email, IsSystemAdmin: true}}, email, false},
+		{"another admin exists", &stubUserService{user: &types.User{ID: "u1", Email: email}, listTotal: 1}, email, false},
+		{"lookup fails", &stubUserService{err: errors.New("record not found")}, email, false},
+		{"admin list unavailable", &stubUserService{user: &types.User{ID: "u1", Email: email}, listErr: errors.New("down")}, email, false},
+		{"write fails", &stubUserService{user: &types.User{ID: "u1", Email: email}, updateErr: errors.New("write failed")}, email, false},
+		{"empty email", &stubUserService{user: &types.User{ID: "u1", Email: email}}, "   ", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PromoteBootstrapSystemAdmin(ctx, tc.svc, tc.mail); got != tc.want {
+				t.Fatalf("PromoteBootstrapSystemAdmin = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
